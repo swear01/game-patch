@@ -1,2 +1,5 @@
 # Preserve the original unified diff context and its line endings.
 *.patch -text -whitespace
+
+# The Minutescape background packager embeds this fragment byte for byte.
+Minutescape/minutescape_speed_background.js -text whitespace=cr-at-eol
