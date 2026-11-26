@@ -1,0 +1,3783 @@
+diff --git a/core/object/message_queue.cpp b/core/object/message_queue.cpp
+index eb2066e..788785d 100644
+--- a/core/object/message_queue.cpp
++++ b/core/object/message_queue.cpp
+@@ -31,6 +31,11 @@
+ #include "message_queue.h"
+ 
+ #include "core/config/project_settings.h"
++#ifdef DEBUG_ENABLED
++#include "core/debugger/engine_debugger.h"
++#include "core/object/callable_method_pointer.h"
++#include "core/os/os.h"
++#endif
+ #include "core/object/class_db.h"
+ #include "core/object/script_language.h"
+ 
+@@ -223,6 +228,184 @@ void CallQueue::_call_function(const Callable &p_callable, const Variant *p_args
+ 	}
+ }
+ 
++
++#ifdef DEBUG_ENABLED
++namespace {
++
++enum class QuarryQueueKind : uint8_t {
++	CALL,
++	SET,
++	NOTIFY,
++	CUSTOM,
++	SKIPPED,
++	OTHER_BUCKET,
++};
++
++struct QuarryQueueKey {
++	QuarryQueueKind kind = QuarryQueueKind::CUSTOM;
++	StringName method;
++	int code = 0;
++	const char *detail = nullptr; // static callable_mp text or explode receiver label
++
++	static uint32_t hash(const QuarryQueueKey &p_key) {
++		const uint32_t base = hash_murmur3_one_32(uint32_t(p_key.code), hash_murmur3_one_32(uint32_t(p_key.kind), p_key.method.hash()));
++		return p_key.detail ? hash_murmur3_one_64(reinterpret_cast<uintptr_t>(p_key.detail), base) : base;
++	}
++
++	bool operator==(const QuarryQueueKey &p_other) const {
++		return kind == p_other.kind && method == p_other.method && code == p_other.code && detail == p_other.detail;
++	}
++
++	String label() const {
++		switch (kind) {
++			case QuarryQueueKind::CALL: return "call:" + String(method) + (detail ? "@" + String(detail) : String());
++			case QuarryQueueKind::SET: return "set:" + String(method);
++			case QuarryQueueKind::NOTIFY: return "notify:" + itos(code);
++			case QuarryQueueKind::CUSTOM: return detail ? "custom:" + String(detail) : (method == StringName() ? String("custom:unnamed") : "custom:" + String(method));
++			case QuarryQueueKind::SKIPPED: return "skipped:" + itos(code);
++			case QuarryQueueKind::OTHER_BUCKET: return "overflow:other";
++		}
++		return "overflow:unexpected";
++	}
++};
++
++struct QuarryQueueMetrics {
++	struct Bucket {
++		uint64_t us = 0;
++		uint32_t calls = 0;
++	};
++	HashMap<QuarryQueueKey, Bucket, QuarryQueueKey> methods;
++	Bucket overflow;
++	uint64_t flush_us = 0;
++	uint64_t dispatch_us = 0;
++	uint32_t messages = 0;
++	uint32_t flushes = 0;
++	uint32_t nonempty = 0;
++	uint32_t busy = 0;
++	// One random position per 32 eligible messages, not periodic sampling
++	// of one fixed position which could alias recurring per-step batches.
++	uint32_t sample_rng = 0xa31a8f35;
++	uint32_t sample_position = 0;
++	uint32_t sample_index = 0;
++
++	bool take_custom_name_sample() {
++		const uint32_t position = sample_position++ & 31;
++		if (position == 0) {
++			sample_rng ^= sample_rng << 13;
++			sample_rng ^= sample_rng >> 17;
++			sample_rng ^= sample_rng << 5;
++			sample_index = sample_rng & 31;
++		}
++		return position == sample_index;
++	}
++
++	void record(const QuarryQueueKey &p_key, uint64_t p_us) {
++		Bucket *row = methods.getptr(p_key);
++		if (!row) {
++			// Keep diagnostic work bounded, including pathological dynamic method keys.
++			row = methods.size() < 128 ? &methods[p_key] : &overflow;
++		}
++		row->us += p_us;
++		++row->calls;
++		dispatch_us += p_us;
++		++messages;
++	}
++
++	void publish(bool p_expand_names) {
++		Array times = { "scene_quarry_deferred_times", "@flush_total", flush_us * 0.000001, "@dispatch_total", dispatch_us * 0.000001 };
++		Array counts = { "scene_quarry_deferred_counts", "@flush_calls", double(flushes), "@nonempty_flushes", double(nonempty), "@busy_flushes", double(busy), "@messages", double(messages) };
++		auto append = [&](const String &p_label, const Bucket &p_row) {
++			times.append(p_label);
++			times.append(p_row.us * 0.000001);
++			counts.append(p_label);
++			counts.append(double(p_row.calls));
++		};
++		if (p_expand_names) {
++			// Literal identity is cheap per message. Merge equal texts from
++			// separate translation units once when the frame is published.
++			HashMap<String, Bucket> merged;
++			for (const KeyValue<QuarryQueueKey, Bucket> &entry : methods) {
++				Bucket &bucket = merged[entry.key.label()];
++				bucket.us += entry.value.us;
++				bucket.calls += entry.value.calls;
++			}
++			for (const KeyValue<String, Bucket> &entry : merged) {
++				append(entry.key, entry.value);
++			}
++		} else {
++			for (const KeyValue<QuarryQueueKey, Bucket> &entry : methods) {
++				append(entry.key.label(), entry.value);
++			}
++		}
++		if (overflow.calls) {
++			const QuarryQueueKey key = { QuarryQueueKind::OTHER_BUCKET, StringName(), 0 };
++			append(key.label(), overflow);
++		}
++		EngineDebugger::profiler_add_frame_data(SNAME("servers"), times);
++		EngineDebugger::profiler_add_frame_data(SNAME("servers"), counts);
++	}
++
++	void clear() {
++		methods.clear();
++		overflow = Bucket{};
++		flush_us = dispatch_us = 0;
++		messages = flushes = nonempty = busy = 0;
++	}
++};
++
++// Sampling is limited to one CallQueue instance in the current thread, and
++// accumulates on that same thread. Other queues, even if drained by callbacks,
++// do not produce samples or enter these counters.
++struct QuarryQueueScope {
++	CallQueue *queue;
++	bool entered = false;
++	bool expand_names = false;
++};
++
++thread_local QuarryQueueScope *quarry_queue_scope = nullptr;
++QuarryQueueMetrics quarry_queue_metrics;
++
++bool quarry_queue_expand_names() {
++	static const bool requested = OS::get_singleton()->get_environment("QUARRY_SCENE_DEFERRED_CUSTOM") == "1";
++	return requested;
++}
++
++bool quarry_queue_enabled() {
++	static const bool requested = OS::get_singleton()->get_environment("QUARRY_SCENE_DEFERRED_PROFILE") == "1";
++	return requested && EngineDebugger::is_active() && EngineDebugger::is_profiling(SNAME("servers"));
++}
++
++} // namespace
++
++void quarry_profiled_scene_physics_queue_flush(CallQueue *p_queue) {
++	if (!quarry_queue_enabled() || quarry_queue_scope) {
++		p_queue->flush();
++		return;
++	}
++	QuarryQueueScope scope = { p_queue, false, quarry_queue_expand_names() };
++	quarry_queue_scope = &scope;
++	const uint32_t original_messages = quarry_queue_metrics.messages;
++	const uint64_t start = OS::get_singleton()->get_ticks_usec();
++	const Error status = p_queue->flush();
++	const uint64_t end = OS::get_singleton()->get_ticks_usec();
++	quarry_queue_scope = nullptr;
++	quarry_queue_metrics.flush_us += end >= start ? end - start : 0;
++	++quarry_queue_metrics.flushes;
++	quarry_queue_metrics.nonempty += quarry_queue_metrics.messages != original_messages;
++	quarry_queue_metrics.busy += status == ERR_BUSY;
++}
++
++void quarry_publish_scene_physics_queue_profile() {
++	if (!quarry_queue_metrics.flushes) {
++		return;
++	}
++	if (quarry_queue_enabled()) {
++		quarry_queue_metrics.publish(quarry_queue_expand_names());
++	}
++	quarry_queue_metrics.clear();
++}
++#endif // DEBUG_ENABLED
++
+ Error CallQueue::flush() {
+ 	LOCK_MUTEX;
+ 
+@@ -238,6 +421,13 @@ Error CallQueue::flush() {
+ 	}
+ 
+ 	flushing = true;
++#ifdef DEBUG_ENABLED
++	const bool quarry_capture = quarry_queue_scope && quarry_queue_scope->queue == this && !quarry_queue_scope->entered;
++	const bool quarry_expand = quarry_capture && quarry_queue_scope->expand_names;
++	if (quarry_capture) {
++		quarry_queue_scope->entered = true;
++	}
++#endif
+ 
+ 	uint32_t i = 0;
+ 	uint32_t offset = 0;
+@@ -261,6 +451,18 @@ Error CallQueue::flush() {
+ 
+ 		UNLOCK_MUTEX;
+ 
++#ifdef DEBUG_ENABLED
++		const bool quarry_has_target = quarry_capture && target != nullptr;
++		const char *quarry_receiver = nullptr;
++		if (quarry_expand && quarry_has_target && (message->type & FLAG_MASK) == TYPE_CALL && message->callable.is_standard() && message->callable.get_method() == SNAME("explode")) {
++			// Read only this standard method's native type, and do it before
++			// the original callback, which can free its receiver.
++			const StringName &receiver_type = target->get_class_name();
++			quarry_receiver = receiver_type == SNAME("RigidBody3D") ? "RigidBody3D" : receiver_type == SNAME("Area3D") ? "Area3D" : "other";
++		}
++		const uint64_t quarry_started = quarry_capture ? OS::get_singleton()->get_ticks_usec() : 0;
++#endif
++
+ 		switch (message->type & FLAG_MASK) {
+ 			case TYPE_CALL: {
+ 				if (target || (message->type & FLAG_NULL_IS_OK)) {
+@@ -281,6 +483,43 @@ Error CallQueue::flush() {
+ 			} break;
+ 		}
+ 
++#ifdef DEBUG_ENABLED
++		if (quarry_capture) {
++			const uint64_t quarry_now = OS::get_singleton()->get_ticks_usec();
++			QuarryQueueKey quarry_key;
++			const int type = message->type & FLAG_MASK;
++			if (!quarry_has_target && !(type == TYPE_CALL && (message->type & FLAG_NULL_IS_OK))) {
++				quarry_key.kind = QuarryQueueKind::SKIPPED;
++				quarry_key.code = type;
++			} else if (type == TYPE_NOTIFICATION) {
++				quarry_key.kind = QuarryQueueKind::NOTIFY;
++				quarry_key.code = message->notification;
++			} else if (message->callable.is_standard()) {
++				quarry_key.kind = type == TYPE_SET ? QuarryQueueKind::SET : QuarryQueueKind::CALL;
++				quarry_key.method = message->callable.get_method();
++				quarry_key.detail = quarry_receiver;
++			} else if (quarry_expand && type == TYPE_CALL && message->callable.is_custom()) {
++				if (quarry_queue_metrics.take_custom_name_sample()) {
++					const auto *method = dynamic_cast<const CallableCustomMethodPointerBase *>(message->callable.get_custom());
++					if (method) {
++						quarry_key.method = method->get_method(); // Stock debug literal; one in 32.
++						if (quarry_key.method == StringName()) {
++							quarry_key.detail = "sampled_nameless_native";
++						}
++					} else {
++						quarry_key.detail = "sampled_other_callable";
++					}
++				} else {
++					quarry_key.detail = "unsampled";
++				}
++			}
++			// The original Message still owns its independent Callable after
++			// dispatch. Do not dereference target (which may have freed itself),
++			// or query a custom Callable's default error-returning get_method().
++			quarry_queue_metrics.record(quarry_key, quarry_now >= quarry_started ? quarry_now - quarry_started : 0);
++		}
++#endif
++
+ 		if ((message->type & FLAG_MASK) != TYPE_NOTIFICATION) {
+ 			Variant *args = (Variant *)(message + 1);
+ 			for (int k = 0; k < message->args; k++) {
+diff --git a/core/object/object.cpp b/core/object/object.cpp
+index 265c2f1..c284f1a 100644
+--- a/core/object/object.cpp
++++ b/core/object/object.cpp
+@@ -30,6 +30,16 @@
+ 
+ #include "object.h"
+ 
++#ifdef DEBUG_ENABLED
++#include "core/config/engine.h"
++#include "core/debugger/engine_debugger.h"
++#include "core/io/json.h"
++#include "core/object/callable_method_pointer.h"
++#include "core/os/thread.h"
++#endif
++
++#include "scene/main/quarry_delete_profiler.h"
++
+ #include "core/extension/gdextension_manager.h"
+ #include "core/io/resource.h"
+ #include "core/object/class_db.h"
+@@ -252,6 +262,7 @@ Object::Connection::Connection(const Variant &p_variant) {
+ }
+ 
+ bool Object::_predelete() {
++	QUARRY_DELETE_SCOPE(OBJECT_PREDELETE);
+ 	_predelete_ok = 1;
+ 	notification(NOTIFICATION_PREDELETE, true);
+ 	if (_predelete_ok) {
+@@ -1207,6 +1218,175 @@ Error Object::_emit_signal(const Variant **p_args, int p_argcount, Callable::Cal
+ 	return emit_signalp(signal, args, argc);
+ }
+ 
++
++#ifdef DEBUG_ENABLED
++namespace {
++
++struct QuarrySignalKey {
++	StringName type;
++	String path;
++	StringName method;
++	bool deferred = false;
++
++	bool operator==(const QuarrySignalKey &p_other) const {
++		return type == p_other.type && path == p_other.path && method == p_other.method && deferred == p_other.deferred;
++	}
++};
++
++struct QuarrySignalKeyHasher {
++	static uint32_t hash(const QuarrySignalKey &p_key) {
++		return hash_murmur3_one_32(p_key.deferred, hash_murmur3_one_32(p_key.method.hash(),
++				hash_murmur3_one_32(p_key.path.hash(), p_key.type.hash())));
++	}
++};
++
++struct QuarrySignalTotals {
++	struct Bucket {
++		uint64_t us = 0;
++		uint32_t calls = 0;
++	};
++	HashMap<QuarrySignalKey, Bucket, QuarrySignalKeyHasher> callbacks;
++	Bucket overflow[2];
++	uint64_t elapsed = 0;
++	uint64_t snapshot = 0;
++	uint32_t emissions = 0;
++	uint32_t slots = 0;
++	uint32_t invalid = 0;
++
++	void add(const QuarrySignalKey &p_key, uint64_t p_us) {
++		Bucket *bucket = callbacks.getptr(p_key);
++		if (!bucket) {
++			bucket = callbacks.size() < 128 ? &callbacks.insert(p_key, Bucket{})->value : &overflow[p_key.deferred];
++		}
++		bucket->us += p_us;
++		bucket->calls++;
++	}
++
++	Array serialize() const {
++		Array rows;
++		for (const KeyValue<QuarrySignalKey, Bucket> &kv : callbacks) {
++			rows.append(Array{ kv.key.deferred, kv.key.type, kv.key.path, kv.key.method, kv.value.calls, kv.value.us });
++		}
++		for (int i = 0; i < 2; i++) {
++			if (overflow[i].calls) {
++				rows.append(Array{ bool(i), "<overflow>", "", "", overflow[i].calls, overflow[i].us });
++			}
++		}
++		return Array{ emissions, slots, invalid, elapsed, snapshot, rows };
++	}
++};
++
++struct QuarrySignalOrigin {
++	const Object *receiver;
++	QuarrySignalKey *key;
++};
++
++QuarrySignalTotals quarry_signals[4];
++// Arm only at the two native SceneTree calls, then consume at Object entry.
++// Nested emissions during callbacks are part of that callback's time.
++thread_local QuarrySignalTotals *quarry_next_signal = nullptr;
++thread_local QuarrySignalOrigin *quarry_signal_origin = nullptr;
++
++bool quarry_signals_enabled(bool p_timer) {
++	static const bool requested = OS::get_singleton()->get_environment("QUARRY_SCENE_FRAME_SIGNALS") == "1";
++	static const bool timers_requested = OS::get_singleton()->get_environment("QUARRY_SCENE_TIMER_SIGNALS") == "1";
++	return (p_timer ? timers_requested : requested) && EngineDebugger::is_active() && EngineDebugger::is_profiling(SNAME("servers"));
++}
++
++QuarrySignalKey quarry_get_signal_key(const Callable &p_callable, const Object *p_receiver, bool p_deferred) {
++	QuarrySignalKey key;
++	key.deferred = p_deferred;
++	const Callable *base = p_callable.get_base_comparator(); // Unwrap standard bind/unbind safely.
++	if (base->is_standard()) {
++		key.method = base->get_method();
++	} else {
++		key.method = SNAME("<custom>");
++#if defined(__cpp_rtti) || defined(_CPPRTTI)
++		// The generic CallableCustom::get_method() can log errors. Only ask
++		// the trusted native method-pointer type for its debug method name.
++		if (const auto *native = dynamic_cast<const CallableCustomMethodPointerBase *>(base->get_custom())) {
++			key.method = native->get_method();
++		}
++#endif
++	}
++	if (p_receiver) {
++		key.type = p_receiver->get_class_name();
++		if (ScriptInstance *instance = p_receiver->get_script_instance()) {
++			const Ref<Script> source = instance->get_script();
++			if (source.is_valid()) {
++				key.path = source->get_path();
++			}
++		} else if (const Script *source = Object::cast_to<Script>(p_receiver)) {
++			key.path = source->get_path();
++		}
++	} else {
++		key.type = SNAME("<no receiver>");
++	}
++	return key;
++}
++
++void quarry_timed_direct_signal(QuarrySignalTotals &p_totals, const Callable &p_callable, const Variant **p_args, int p_argc,
++		Variant &r_ret, Callable::CallError &r_error) {
++	const Object *receiver = p_callable.get_object();
++	QuarrySignalKey key = quarry_get_signal_key(p_callable, receiver, false);
++	QuarrySignalOrigin origin{ receiver, &key };
++	if (key.type == SNAME("GDScriptFunctionState") && key.method == SNAME("_signal_callback")) {
++		quarry_signal_origin = &origin;
++	}
++	const uint64_t start = OS::get_singleton()->get_ticks_usec();
++	p_callable.callp(p_args, p_argc, r_ret, r_error);
++	const uint64_t elapsed = OS::get_singleton()->get_ticks_usec() - start;
++	quarry_signal_origin = nullptr;
++	p_totals.add(key, elapsed);
++}
++
++void quarry_timed_deferred_signal(QuarrySignalTotals &p_totals, const Callable &p_callable, const Variant **p_args, int p_argc) {
++	const QuarrySignalKey key = quarry_get_signal_key(p_callable, p_callable.get_object(), true);
++	const uint64_t start = OS::get_singleton()->get_ticks_usec();
++	MessageQueue::get_singleton()->push_callablep(p_callable, p_args, p_argc, true);
++	p_totals.add(key, OS::get_singleton()->get_ticks_usec() - start);
++}
++
++} // namespace
++
++void quarry_label_scene_frame_coroutine(const Object *p_state, const String &p_path, const StringName &p_function) {
++	QuarrySignalOrigin *origin = quarry_signal_origin;
++	if (origin && origin->receiver == p_state) {
++		origin->key->path = p_path;
++		origin->key->method = p_function;
++		quarry_signal_origin = nullptr;
++	}
++}
++
++void quarry_profile_scene_frame_signal(Object *p_tree, const StringName &p_signal, bool p_physics, bool p_timer) {
++	if (!Thread::is_main_thread() || !quarry_signals_enabled(p_timer)) {
++		p_tree->emit_signal(p_signal);
++		return;
++	}
++	QuarrySignalTotals &totals = quarry_signals[(p_timer ? 2 : 0) + (p_physics ? 0 : 1)];
++	totals.emissions++;
++	const uint64_t start = OS::get_singleton()->get_ticks_usec();
++	quarry_next_signal = &totals;
++	p_tree->emit_signal(p_signal);
++	quarry_next_signal = nullptr; // Also clear on blocked-signal early return.
++	totals.elapsed += OS::get_singleton()->get_ticks_usec() - start;
++}
++
++void quarry_publish_scene_frame_signals() {
++	for (int i = 0; i < 4; i += 2) {
++		const bool timer = i == 2;
++		if (quarry_signals[i].emissions || quarry_signals[i + 1].emissions || (timer && quarry_signals_enabled(true))) {
++			if (quarry_signals_enabled(timer)) {
++				const Array packet{ Engine::get_singleton()->get_process_frames(), quarry_signals[i].serialize(), quarry_signals[i + 1].serialize() };
++				print_line(String(timer ? "QUARRY_TIMER_SIGNAL " : "QUARRY_FRAME_SIGNAL ") + JSON::stringify(packet));
++			}
++			quarry_signals[i] = QuarrySignalTotals{};
++			quarry_signals[i + 1] = QuarrySignalTotals{};
++		}
++	}
++}
++#endif
++
+ Error Object::emit_signalp(const StringName &p_name, const Variant **p_args, int p_argcount) {
+ 	if (_block_signals) {
+ 		return ERR_CANT_ACQUIRE_RESOURCE; //no emit, signals blocked
+@@ -1220,6 +1400,13 @@ Error Object::emit_signalp(const StringName &p_name, const Variant **p_args, int
+ 	Callable *slot_callables = (Callable *)slot_callable_stack;
+ 	uint32_t *slot_flags = slot_flags_stack;
+ 	uint32_t slot_count = 0;
++#ifdef DEBUG_ENABLED
++	QuarrySignalTotals *const quarry_sample = quarry_next_signal;
++	if (quarry_sample) {
++		quarry_next_signal = nullptr;
++	}
++	const uint64_t quarry_snapshot_start = quarry_sample ? OS::get_singleton()->get_ticks_usec() : 0;
++#endif
+ 
+ 	{
+ 		OBJ_SIGNAL_LOCK
+@@ -1265,6 +1452,13 @@ Error Object::emit_signalp(const StringName &p_name, const Variant **p_args, int
+ 		}
+ 	}
+ 
++#ifdef DEBUG_ENABLED
++	if (quarry_sample) {
++		quarry_sample->slots += slot_count;
++		quarry_sample->snapshot += OS::get_singleton()->get_ticks_usec() - quarry_snapshot_start;
++	}
++#endif
++
+ 	OBJ_DEBUG_LOCK
+ 
+ 	// If this is a ref-counted object, prevent it from being destroyed during signal
+@@ -1281,6 +1475,11 @@ Error Object::emit_signalp(const StringName &p_name, const Variant **p_args, int
+ 		const uint32_t &flags = slot_flags[i];
+ 
+ 		if (!callable.is_valid()) {
++#ifdef DEBUG_ENABLED
++			if (quarry_sample) {
++				quarry_sample->invalid++;
++			}
++#endif
+ 			// Target might have been deleted during signal callback, this is expected and OK.
+ 			continue;
+ 		}
+@@ -1289,12 +1488,26 @@ Error Object::emit_signalp(const StringName &p_name, const Variant **p_args, int
+ 		int argc = p_argcount;
+ 
+ 		if (flags & CONNECT_DEFERRED) {
+-			MessageQueue::get_singleton()->push_callablep(callable, args, argc, true);
++#ifdef DEBUG_ENABLED
++			if (quarry_sample) {
++				quarry_timed_deferred_signal(*quarry_sample, callable, args, argc);
++			} else
++#endif
++			{
++				MessageQueue::get_singleton()->push_callablep(callable, args, argc, true);
++			}
+ 		} else {
+ 			Callable::CallError ce;
+ 			_emitting = true;
+ 			Variant ret;
+-			callable.callp(args, argc, ret, ce);
++#ifdef DEBUG_ENABLED
++			if (quarry_sample) {
++				quarry_timed_direct_signal(*quarry_sample, callable, args, argc, ret, ce);
++			} else
++#endif
++			{
++				callable.callp(args, argc, ret, ce);
++			}
+ 			_emitting = false;
+ 
+ 			if (ce.error != Callable::CallError::CALL_OK) {
+@@ -2262,6 +2475,7 @@ void Object::assign_class_name_static(const Span<char> &p_name, StringName &r_ta
+ }
+ 
+ Object::~Object() {
++	QUARRY_DELETE_SCOPE(OBJECT_DESTRUCTOR);
+ 	if (script_instance) {
+ 		memdelete(script_instance);
+ 	}
+diff --git a/main/main.cpp b/main/main.cpp
+index 62dafe8..f5fd356 100644
+--- a/main/main.cpp
++++ b/main/main.cpp
+@@ -4671,6 +4671,157 @@ static uint64_t physics_process_max = 0;
+ static uint64_t process_max = 0;
+ static uint64_t navigation_process_max = 0;
+ 
++#ifdef DEBUG_ENABLED
++namespace {
++
++class QuarryMainProfile {
++	bool valid;
++	const uint64_t start;
++	uint64_t last;
++
++	static bool _enabled() {
++		static const bool requested = OS::get_singleton()->get_environment("QUARRY_MAIN_LOOP_SPLIT") == "1";
++		return requested && EngineDebugger::is_active() && EngineDebugger::is_profiling(SNAME("servers"));
++	}
++
++public:
++	enum Phase {
++		OUTER_PREAMBLE,
++		PHYSICS_INPUT,
++		PHYSICS_PREPARE,
++		PHYSICS_3D_SYNC,
++		PHYSICS_3D_FLUSH_QUERIES,
++		PHYSICS_2D_QUERIES,
++		SCENE_PHYSICS,
++		PHYSICS_EXIT_CLEANUP,
++		NAVIGATION_PHYSICS,
++		QUEUE_AFTER_NAVIGATION,
++		PHYSICS_3D_END_SYNC,
++		PHYSICS_3D_STEP,
++		PHYSICS_2D_STEP,
++		QUEUE_AFTER_PHYSICS,
++		PHYSICS_FINALIZE,
++		IDLE_INPUT,
++		SCENE_IDLE,
++		QUEUE_IDLE,
++		NAVIGATION_IDLE,
++		RENDER_SYNC,
++		RENDER_PREPARE,
++		RENDER_DRAW,
++		RENDER_FINALIZE,
++		EXTENSIONS_SCRIPTS,
++		AUDIO_UPDATE,
++		PHASE_COUNT,
++	};
++	uint64_t elapsed[PHASE_COUNT];
++	int physics_iterations = 0;
++	int step_3d_calls = 0;
++	int draw_calls = 0;
++	int present_requests = 0;
++
++	explicit QuarryMainProfile(uint64_t p_start) :
++			valid(_enabled()),
++			start(p_start),
++			last(p_start) {
++		if (valid) {
++			for (uint64_t &ticks : elapsed) {
++				ticks = 0;
++			}
++		}
++	}
++
++	void mark_at(Phase p_phase, uint64_t p_at) {
++		if (!valid) {
++			return;
++		}
++		if (unlikely(p_at < last)) {
++			valid = false;
++			return;
++		}
++		elapsed[p_phase] += p_at - last;
++		last = p_at;
++	}
++
++	void mark(Phase p_phase) {
++		if (valid) {
++			mark_at(p_phase, OS::get_singleton()->get_ticks_usec());
++		}
++	}
++
++	void count(int &r_count, int p_n = 1) const {
++		if (valid) {
++			r_count += p_n;
++		}
++	}
++
++	void emit() const {
++		if (!valid) {
++			return;
++		}
++		static const char *const names[PHASE_COUNT] = {
++			"outer_preamble",
++			"physics_input",
++			"physics_prepare",
++			"physics_3d_sync",
++			"physics_3d_flush_queries",
++			"physics_2d_queries",
++			"scene_physics",
++			"physics_exit_cleanup",
++			"navigation_physics",
++			"queue_after_navigation",
++			"physics_3d_end_sync",
++			"physics_3d_step",
++			"physics_2d_step",
++			"queue_after_physics",
++			"physics_finalize",
++			"idle_input",
++			"scene_idle",
++			"queue_idle",
++			"navigation_idle",
++			"render_sync",
++			"render_prepare",
++			"render_draw",
++			"render_finalize",
++			"extensions_scripts",
++			"audio_update",
++		};
++		Array times;
++		times.push_back("main_quarry_times");
++		for (int i = 0; i < PHASE_COUNT; ++i) {
++			if (elapsed[i] > 0) {
++				times.push_back(names[i]);
++				times.push_back(double(elapsed[i]) * 0.000001);
++			}
++		}
++		times.push_back("accounted_outer");
++		times.push_back(double(last - start) * 0.000001);
++		EngineDebugger::profiler_add_frame_data(SNAME("servers"), times);
++
++		Array counts;
++		counts.push_back("main_quarry_counts");
++		counts.push_back("physics_iterations");
++		counts.push_back(physics_iterations);
++		counts.push_back("step_3d_calls");
++		counts.push_back(step_3d_calls);
++		counts.push_back("draw_calls");
++		counts.push_back(draw_calls);
++		counts.push_back("present_requests");
++		counts.push_back(present_requests);
++		EngineDebugger::profiler_add_frame_data(SNAME("servers"), counts);
++	}
++};
++
++} // namespace
++
++#define QUARRY_MAIN_MARK(m_phase) quarry_profile.mark(QuarryMainProfile::m_phase)
++#define QUARRY_MAIN_MARK_AT(m_phase, m_tick) quarry_profile.mark_at(QuarryMainProfile::m_phase, m_tick)
++#define QUARRY_MAIN_COUNT(m_field, m_n) quarry_profile.count(quarry_profile.m_field, m_n)
++#else
++#define QUARRY_MAIN_MARK(m_phase) ((void)0)
++#define QUARRY_MAIN_MARK_AT(m_phase, m_tick) ((void)0)
++#define QUARRY_MAIN_COUNT(m_field, m_n) ((void)0)
++#endif
++
+ // Return false means iterating further, returning true means `OS::run`
+ // will terminate the program. In case of failure, the OS exit code needs
+ // to be set explicitly here (defaults to EXIT_SUCCESS).
+@@ -4678,6 +4829,9 @@ bool Main::iteration() {
+ 	iterating++;
+ 
+ 	const uint64_t ticks = OS::get_singleton()->get_ticks_usec();
++#ifdef DEBUG_ENABLED
++	QuarryMainProfile quarry_profile(ticks);
++#endif
+ 	Engine::get_singleton()->_frame_ticks = ticks;
+ 	main_timer_sync.set_cpu_ticks_usec(ticks);
+ 	main_timer_sync.set_fixed_fps(fixed_fps);
+@@ -4719,7 +4873,9 @@ bool Main::iteration() {
+ 	XRServer::get_singleton()->_process();
+ #endif // XR_DISABLED
+ 
++	QUARRY_MAIN_MARK(OUTER_PREAMBLE);
+ 	for (int iters = 0; iters < advance.physics_steps; ++iters) {
++		QUARRY_MAIN_COUNT(physics_iterations, 1);
+ 		if (Input::get_singleton()->is_agile_input_event_flushing()) {
+ 			Input::get_singleton()->flush_buffered_events();
+ 		}
+@@ -4728,23 +4884,30 @@ bool Main::iteration() {
+ 		Engine::get_singleton()->_physics_frames++;
+ 
+ 		uint64_t physics_begin = OS::get_singleton()->get_ticks_usec();
++		QUARRY_MAIN_MARK_AT(PHYSICS_INPUT, physics_begin);
+ 
+ 		// Prepare the fixed timestep interpolated nodes BEFORE they are updated
+ 		// by the physics server, otherwise the current and previous transforms
+ 		// may be the same, and no interpolation takes place.
+ 		OS::get_singleton()->get_main_loop()->iteration_prepare();
++		QUARRY_MAIN_MARK(PHYSICS_PREPARE);
+ 
+ #ifndef PHYSICS_3D_DISABLED
+ 		PhysicsServer3D::get_singleton()->sync();
++		QUARRY_MAIN_MARK(PHYSICS_3D_SYNC);
+ 		PhysicsServer3D::get_singleton()->flush_queries();
++		QUARRY_MAIN_MARK(PHYSICS_3D_FLUSH_QUERIES);
+ #endif // PHYSICS_3D_DISABLED
+ 
+ #ifndef PHYSICS_2D_DISABLED
+ 		PhysicsServer2D::get_singleton()->sync();
+ 		PhysicsServer2D::get_singleton()->flush_queries();
++		QUARRY_MAIN_MARK(PHYSICS_2D_QUERIES);
+ #endif // PHYSICS_2D_DISABLED
+ 
+-		if (OS::get_singleton()->get_main_loop()->physics_process(physics_step * time_scale)) {
++		const bool physics_exit = OS::get_singleton()->get_main_loop()->physics_process(physics_step * time_scale);
++		QUARRY_MAIN_MARK(SCENE_PHYSICS);
++		if (physics_exit) {
+ #ifndef PHYSICS_3D_DISABLED
+ 			PhysicsServer3D::get_singleton()->end_sync();
+ #endif // PHYSICS_3D_DISABLED
+@@ -4754,6 +4917,7 @@ bool Main::iteration() {
+ 
+ 			Engine::get_singleton()->_in_physics = false;
+ 			exit = true;
++			QUARRY_MAIN_MARK(PHYSICS_EXIT_CLEANUP);
+ 			break;
+ 		}
+ 
+@@ -4770,20 +4934,27 @@ bool Main::iteration() {
+ 		navigation_process_ticks = MAX(navigation_process_ticks, OS::get_singleton()->get_ticks_usec() - navigation_begin); // keep the largest one for reference
+ 		navigation_process_max = MAX(OS::get_singleton()->get_ticks_usec() - navigation_begin, navigation_process_max);
+ 
++		QUARRY_MAIN_MARK(NAVIGATION_PHYSICS);
+ 		message_queue->flush();
++		QUARRY_MAIN_MARK(QUEUE_AFTER_NAVIGATION);
+ #endif // !defined(NAVIGATION_2D_DISABLED) || !defined(NAVIGATION_3D_DISABLED)
+ 
+ #ifndef PHYSICS_3D_DISABLED
+ 		PhysicsServer3D::get_singleton()->end_sync();
++		QUARRY_MAIN_MARK(PHYSICS_3D_END_SYNC);
+ 		PhysicsServer3D::get_singleton()->step(physics_step * time_scale);
++		QUARRY_MAIN_MARK(PHYSICS_3D_STEP);
++		QUARRY_MAIN_COUNT(step_3d_calls, 1);
+ #endif // PHYSICS_3D_DISABLED
+ 
+ #ifndef PHYSICS_2D_DISABLED
+ 		PhysicsServer2D::get_singleton()->end_sync();
+ 		PhysicsServer2D::get_singleton()->step(physics_step * time_scale);
++		QUARRY_MAIN_MARK(PHYSICS_2D_STEP);
+ #endif // PHYSICS_2D_DISABLED
+ 
+ 		message_queue->flush();
++		QUARRY_MAIN_MARK(QUEUE_AFTER_PHYSICS);
+ 
+ 		OS::get_singleton()->get_main_loop()->iteration_end();
+ 
+@@ -4791,6 +4962,7 @@ bool Main::iteration() {
+ 		physics_process_max = MAX(OS::get_singleton()->get_ticks_usec() - physics_begin, physics_process_max);
+ 
+ 		Engine::get_singleton()->_in_physics = false;
++		QUARRY_MAIN_MARK(PHYSICS_FINALIZE);
+ 	}
+ 
+ 	if (Input::get_singleton()->is_agile_input_event_flushing()) {
+@@ -4798,11 +4970,14 @@ bool Main::iteration() {
+ 	}
+ 
+ 	uint64_t process_begin = OS::get_singleton()->get_ticks_usec();
++	QUARRY_MAIN_MARK_AT(IDLE_INPUT, process_begin);
+ 
+ 	if (OS::get_singleton()->get_main_loop()->process(process_step * time_scale)) {
+ 		exit = true;
+ 	}
++	QUARRY_MAIN_MARK(SCENE_IDLE);
+ 	message_queue->flush();
++	QUARRY_MAIN_MARK(QUEUE_IDLE);
+ 
+ #ifndef NAVIGATION_2D_DISABLED
+ 	NavigationServer2D::get_singleton()->process(process_step * time_scale);
+@@ -4811,7 +4986,12 @@ bool Main::iteration() {
+ 	NavigationServer3D::get_singleton()->process(process_step * time_scale);
+ #endif // NAVIGATION_3D_DISABLED
+ 
++#if !defined(NAVIGATION_2D_DISABLED) || !defined(NAVIGATION_3D_DISABLED)
++	QUARRY_MAIN_MARK(NAVIGATION_IDLE);
++#endif // !defined(NAVIGATION_2D_DISABLED) || !defined(NAVIGATION_3D_DISABLED)
++
+ 	RenderingServer::get_singleton()->sync(); //sync if still drawing from previous frames.
++	QUARRY_MAIN_MARK(RENDER_SYNC);
+ 
+ 	const bool has_pending_resources_for_processing = RD::get_singleton() && RD::get_singleton()->has_pending_resources_for_processing();
+ 	bool wants_present = (DisplayServer::get_singleton()->can_any_window_draw() ||
+@@ -4822,11 +5002,19 @@ bool Main::iteration() {
+ 		wants_present |= force_redraw_requested;
+ 		if ((!force_redraw_requested) && OS::get_singleton()->is_in_low_processor_usage_mode()) {
+ 			if (RenderingServer::get_singleton()->has_changed()) {
++				QUARRY_MAIN_MARK(RENDER_PREPARE);
+ 				RenderingServer::get_singleton()->draw(wants_present, scaled_step); // flush visual commands
++				QUARRY_MAIN_MARK(RENDER_DRAW);
++				QUARRY_MAIN_COUNT(draw_calls, 1);
++				QUARRY_MAIN_COUNT(present_requests, int(wants_present));
+ 				Engine::get_singleton()->increment_frames_drawn();
+ 			}
+ 		} else {
++			QUARRY_MAIN_MARK(RENDER_PREPARE);
+ 			RenderingServer::get_singleton()->draw(wants_present, scaled_step); // flush visual commands
++			QUARRY_MAIN_MARK(RENDER_DRAW);
++			QUARRY_MAIN_COUNT(draw_calls, 1);
++			QUARRY_MAIN_COUNT(present_requests, int(wants_present));
+ 			Engine::get_singleton()->increment_frames_drawn();
+ 			force_redraw_requested = false;
+ 		}
+@@ -4835,6 +5023,7 @@ bool Main::iteration() {
+ 	process_ticks = OS::get_singleton()->get_ticks_usec() - process_begin;
+ 	process_max = MAX(process_ticks, process_max);
+ 	uint64_t frame_time = OS::get_singleton()->get_ticks_usec() - ticks;
++	QUARRY_MAIN_MARK_AT(RENDER_FINALIZE, frame_time + ticks);
+ 
+ 	GDExtensionManager::get_singleton()->frame();
+ 
+@@ -4842,7 +5031,12 @@ bool Main::iteration() {
+ 		ScriptServer::get_language(i)->frame();
+ 	}
+ 
++	QUARRY_MAIN_MARK(EXTENSIONS_SCRIPTS);
+ 	AudioServer::get_singleton()->update();
++	QUARRY_MAIN_MARK(AUDIO_UPDATE);
++#ifdef DEBUG_ENABLED
++	quarry_profile.emit();
++#endif
+ 
+ 	if (EngineDebugger::is_active()) {
+ 		EngineDebugger::get_singleton()->iteration(frame_time, process_ticks, physics_process_ticks, physics_step);
+@@ -4934,6 +5128,10 @@ bool Main::iteration() {
+ 	return exit;
+ }
+ 
++#undef QUARRY_MAIN_MARK
++#undef QUARRY_MAIN_MARK_AT
++#undef QUARRY_MAIN_COUNT
++
+ void Main::force_redraw() {
+ 	force_redraw_requested = true;
+ }
+diff --git a/modules/gdscript/gdscript_function.cpp b/modules/gdscript/gdscript_function.cpp
+index 03c7e7d..0db80b9 100644
+--- a/modules/gdscript/gdscript_function.cpp
++++ b/modules/gdscript/gdscript_function.cpp
+@@ -134,6 +134,10 @@ GDScriptFunction::~GDScriptFunction() {
+ 
+ /////////////////////
+ 
++#ifdef DEBUG_ENABLED
++void quarry_label_scene_frame_coroutine(const Object *p_state, const String &p_path, const StringName &p_function);
++#endif
++
+ Variant GDScriptFunctionState::_signal_callback(const Variant **p_args, int p_argcount, Callable::CallError &r_error) {
+ 	Variant arg;
+ 	r_error.error = Callable::CallError::CALL_OK;
+@@ -163,6 +167,11 @@ Variant GDScriptFunctionState::_signal_callback(const Variant **p_args, int p_ar
+ 		return Variant();
+ 	}
+ 
++#ifdef DEBUG_ENABLED
++	// A bound _signal_callback alone loses the script/function that awaited.
++	// Use the immutable debug origin on the selected direct signal callback.
++	quarry_label_scene_frame_coroutine(this, state.script_path, state.function_name);
++#endif
+ 	return resume(arg);
+ }
+ 
+diff --git a/modules/jolt_physics/spaces/jolt_job_system.cpp b/modules/jolt_physics/spaces/jolt_job_system.cpp
+index 2022c12..51e55f9 100644
+--- a/modules/jolt_physics/spaces/jolt_job_system.cpp
++++ b/modules/jolt_physics/spaces/jolt_job_system.cpp
+@@ -38,6 +38,7 @@
+ #include "core/os/time.h"
+ 
+ #include "Jolt/Physics/PhysicsSettings.h"
++#include "Jolt/Physics/QuarryFindSplit.h"
+ 
+ void JoltJobSystem::Job::_execute(void *p_user_data) {
+ 	Job *job = static_cast<Job *>(p_user_data);
+@@ -179,6 +180,66 @@ void JoltJobSystem::flush_timings() {
+ 	static const StringName profiler_name("servers");
+ 
+ 	EngineDebugger *engine_debugger = EngineDebugger::get_singleton();
++	// This flag is immutable for a profiler process. Per-pair QPC reads are
++	// enabled only for the timing run; the counts-only run helps expose overhead.
++	static const String quarry_mode = OS::get_singleton()->get_environment("QUARRY_JOLT_FIND_SPLIT");
++	static const bool quarry_requested = quarry_mode == "1" || quarry_mode == "counts";
++	if (quarry_requested) {
++		const bool enabled = engine_debugger->is_profiling(profiler_name);
++		QuarryFindSplit::set_enabled(enabled, quarry_mode == "1");
++		const QuarryFindSplit::Totals all = QuarryFindSplit::take_completed();
++		if (enabled && all.jobs > 0) {
++			Array timing;
++			timing.push_back("physics_3d_quarry_times");
++			auto add_time = [&](const char *p_name, QuarryFindSplit::Count p_ns) {
++				timing.push_back(p_name);
++				timing.push_back(double(p_ns) * 1e-9);
++			};
++			const auto broad_exclusive = QuarryFindSplit::subtract(all.broad_ns, all.inline_pair_ns);
++			add_time("all_find_jobs", all.job_ns);
++			add_time("broad_excluding_inline_pairs", broad_exclusive);
++			add_time("broad_inclusive", all.broad_ns);
++			add_time("inline_pairs", all.inline_pair_ns);
++			add_time("all_pair_processing", all.pair_ns);
++			add_time("cache_hit_reuse", all.cache_hit_ns);
++			add_time("cache_miss_lookup", all.cache_miss_ns);
++			add_time("cache_insert", all.insert_ns);
++			add_time("narrow_new_contacts", all.narrow_ns);
++			add_time("shape_dispatch_sensor", all.sensor_shape_ns);
++			add_time("shape_dispatch_rigid", all.shape_ns);
++			add_time("find_loop_and_scheduling", QuarryFindSplit::subtract(all.job_ns, broad_exclusive + all.pair_ns));
++			add_time("pair_misc", QuarryFindSplit::subtract(all.pair_ns, all.cache_hit_ns + all.cache_miss_ns + all.insert_ns + all.narrow_ns));
++			add_time("narrow_outside_shape_dispatch", QuarryFindSplit::subtract(all.narrow_ns, all.shape_ns + all.sensor_shape_ns));
++			engine_debugger->profiler_add_frame_data(profiler_name, timing);
++
++			Array counts;
++			counts.push_back("physics_3d_quarry_counts");
++			auto add_count = [&](const char *p_name, QuarryFindSplit::Count p_count) {
++				counts.push_back(p_name);
++				counts.push_back(double(p_count));
++			};
++			add_count("jobs_including_main", all.jobs);
++			add_count("broad_batches", all.broad_batches);
++			add_count("active_bodies_examined", all.active_bodies);
++			add_count("candidate_pairs", all.candidate_pairs);
++			add_count("inline_candidate_pairs", all.inline_pairs);
++			add_count("pairs_processed", all.pairs);
++			add_count("sensor_pairs", all.sensor_pairs);
++			add_count("cache_bypass", all.cache_bypass);
++			add_count("cache_lookups", all.cache_lookups);
++			add_count("cache_hits", all.cache_hits);
++			add_count("cache_misses", all.cache_misses);
++			add_count("cache_missing_record", all.cache_missing_record);
++			add_count("cache_position_reject", all.cache_position_reject);
++			add_count("cache_rotation_reject", all.cache_rotation_reject);
++			add_count("cache_zero_manifolds", all.cache_zero_manifolds);
++			add_count("cache_reuse_write_full", all.cache_write_full);
++			add_count("new_body_pairs", all.new_body_pairs);
++			add_count("new_pair_write_full", all.new_body_pair_full);
++			add_count("narrow_pairs", all.narrow_pairs);
++			engine_debugger->profiler_add_frame_data(profiler_name, counts);
++		}
++	}
+ 
+ 	if (engine_debugger->is_profiling(profiler_name)) {
+ 		Array timings;
+diff --git a/modules/raycast/SCsub b/modules/raycast/SCsub
+index 4c2713e..c860941 100644
+--- a/modules/raycast/SCsub
++++ b/modules/raycast/SCsub
+@@ -76,6 +76,10 @@ if env["builtin_embree"]:
+         env_raycast.Append(CCFLAGS=["/wd4324"])
+ 
+     env_thirdparty = env_raycast.Clone()
++    # The bundled Embree source list omits AVX packet kernels. Keep its
++    # original ISA, even when the rest of this private build targets Zen 2.
++    if "-march=znver2" in env_thirdparty["CCFLAGS"]:
++        env_thirdparty.Replace(CCFLAGS=[flag for flag in env_thirdparty["CCFLAGS"] if flag != "-march=znver2"])
+     env_thirdparty.force_optimization_on_debug()
+     env_thirdparty.disable_warnings()
+     env_thirdparty.add_source_files(thirdparty_obj, thirdparty_sources)
+diff --git a/scene/3d/audio_stream_player_3d.cpp b/scene/3d/audio_stream_player_3d.cpp
+index 6a554c1..44e8eca 100644
+--- a/scene/3d/audio_stream_player_3d.cpp
++++ b/scene/3d/audio_stream_player_3d.cpp
+@@ -32,6 +32,7 @@
+ #include "audio_stream_player_3d.compat.inc"
+ 
+ #include "core/config/project_settings.h"
++#include "core/os/os.h"
+ #include "scene/3d/audio_listener_3d.h"
+ #include "scene/3d/camera_3d.h"
+ #include "scene/3d/velocity_tracker_3d.h"
+@@ -280,9 +281,17 @@ void AudioStreamPlayer3D::_notification(int p_what) {
+ 		case NOTIFICATION_INTERNAL_PHYSICS_PROCESS: {
+ 			// Update anything related to position first, if possible of course.
+ 			Vector<AudioFrame> volume_vector;
+-			if (setplay.get() > 0 || (internal->active.is_set() && last_mix_count != AudioServer::get_singleton()->get_mix_count()) || force_update_panning) {
++			static const bool quarry_mix_epoch = OS::get_singleton()->get_environment("QUARRY_TEST_PROFILE") == "1" && OS::get_singleton()->get_environment("QUARRY_AUDIO3D_MIX_EPOCH") == "1";
++			const uint64_t mix_epoch = quarry_mix_epoch ? AudioServer::get_singleton()->get_mix_count() : 0;
++			// Unlike an existing playback, one starting at 0 still needs a fresh volume vector.
++			const bool quarry_pending_start = quarry_mix_epoch && setplayback.is_valid() && setplay.get() >= 0.0f;
++			if (quarry_pending_start || setplay.get() > 0 || (internal->active.is_set() && last_mix_count != (quarry_mix_epoch ? mix_epoch : AudioServer::get_singleton()->get_mix_count())) || force_update_panning) {
+ 				force_update_panning = false;
+ 				volume_vector = _update_panning();
++				if (quarry_mix_epoch) {
++					// Use the epoch at entry so a concurrent device mix is not missed.
++					last_mix_count = mix_epoch;
++				}
+ 			}
+ 
+ 			if (setplayback.is_valid() && setplay.get() >= 0) {
+diff --git a/scene/3d/node_3d.cpp b/scene/3d/node_3d.cpp
+index b3ceab4..d91c457 100644
+--- a/scene/3d/node_3d.cpp
++++ b/scene/3d/node_3d.cpp
+@@ -28,6 +28,8 @@
+ /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+ /**************************************************************************/
+ 
++#define QUARRY_NATIVE_TRANSFORM_ATTRIBUTION
++
+ #include "node_3d.h"
+ 
+ #include "core/math/transform_interpolator.h"
+@@ -35,6 +37,12 @@
+ #include "scene/main/viewport.h"
+ #include "scene/property_utils.h"
+ 
++#ifdef QUARRY_NATIVE_TRANSFORM_ATTRIBUTION
++extern thread_local bool quarry_transform_recursion_armed;
++uint64_t quarry_transform_root_enter();
++void quarry_transform_root_leave(Node3D *p_node, uint64_t p_start);
++#endif
++
+ /*
+ 
+  possible algorithms:
+@@ -108,6 +116,10 @@ void Node3D::_propagate_transform_changed(Node3D *p_origin) {
+ 		return;
+ 	}
+ 
++#ifdef QUARRY_NATIVE_TRANSFORM_ATTRIBUTION
++	const uint64_t quarry_root_start = unlikely(quarry_transform_recursion_armed) && p_origin == this ? quarry_transform_root_enter() : 0;
++#endif
++
+ 	for (Node3D *&E : data.children) {
+ 		if (E->data.top_level) {
+ 			continue; //don't propagate to a top_level
+@@ -127,6 +139,11 @@ void Node3D::_propagate_transform_changed(Node3D *p_origin) {
+ 		}
+ 	}
+ 	_set_dirty_bits(DIRTY_GLOBAL_TRANSFORM | DIRTY_GLOBAL_INTERPOLATED_TRANSFORM);
++#ifdef QUARRY_NATIVE_TRANSFORM_ATTRIBUTION
++	if (unlikely(quarry_root_start != 0)) {
++		quarry_transform_root_leave(this, quarry_root_start);
++	}
++#endif
+ }
+ 
+ void Node3D::_notification(int p_what) {
+diff --git a/scene/3d/sprite_3d.cpp b/scene/3d/sprite_3d.cpp
+index 8663e68..a3169c1 100644
+--- a/scene/3d/sprite_3d.cpp
++++ b/scene/3d/sprite_3d.cpp
+@@ -32,6 +32,98 @@
+ 
+ #include "scene/resources/atlas_texture.h"
+ 
++#include "core/config/engine.h"
++#include "core/os/os.h"
++
++#ifdef DEBUG_ENABLED
++#include "core/string/print_string.h"
++#include "core/templates/hash_map.h"
++
++namespace {
++
++struct QuarrySpriteUpload {
++	SpriteBase3D *owner = nullptr;
++	RID mesh;
++	const PackedByteArray *vertices = nullptr;
++	const PackedByteArray *attributes = nullptr;
++};
++
++struct QuarrySpriteUploads {
++	HashMap<ObjectID, QuarrySpriteUpload> pending;
++	uint64_t physics_upload_requests = 0;
++	uint64_t queued_uploads = 0;
++	uint64_t coalesced_uploads = 0;
++	uint64_t direct_uploads = 0;
++	uint64_t flushed_uploads = 0;
++	uint64_t canceled_by_direct = 0;
++	uint64_t canceled_on_destroy = 0;
++	uint64_t stale_owners = 0;
++	uint64_t nonempty_flushes = 0;
++	uint64_t direct_submit_us = 0;
++	uint64_t draw_submit_us = 0;
++};
++
++QuarrySpriteUploads quarry_sprite_uploads;
++
++bool quarry_sprite_upload_enabled() {
++	static const bool enabled = OS::get_singleton()->get_environment("QUARRY_SPRITE_MESH_UPLOAD_BATCH") == "1";
++	return enabled;
++}
++
++bool quarry_sprite_upload_report_enabled() {
++	static const bool report = OS::get_singleton()->get_environment("QUARRY_SPRITE_MESH_UPLOAD_BATCH_REPORT") == "1";
++	return report;
++}
++
++void quarry_sprite_submit_pair(RID p_mesh, const PackedByteArray &p_vertices, const PackedByteArray &p_attributes, uint64_t *r_timing) {
++	const uint64_t before = r_timing ? OS::get_singleton()->get_ticks_usec() : 0;
++	RS::get_singleton()->mesh_surface_update_vertex_region(p_mesh, 0, 0, p_vertices);
++	RS::get_singleton()->mesh_surface_update_attribute_region(p_mesh, 0, 0, p_attributes);
++	if (r_timing) {
++		const uint64_t after = OS::get_singleton()->get_ticks_usec();
++		if (after >= before) {
++			*r_timing += after - before;
++		}
++	}
++}
++
++} // namespace
++
++bool quarry_sprite_uploads_pending() {
++	return quarry_sprite_upload_enabled() && Thread::is_main_thread() && !quarry_sprite_uploads.pending.is_empty();
++}
++
++void quarry_flush_sprite_uploads_before_draw() {
++	if (!quarry_sprite_uploads_pending()) {
++		return;
++	}
++	const bool report = quarry_sprite_upload_report_enabled();
++	++quarry_sprite_uploads.nonempty_flushes;
++	for (const KeyValue<ObjectID, QuarrySpriteUpload> &entry : quarry_sprite_uploads.pending) {
++		const QuarrySpriteUpload &upload = entry.value;
++		// The sprite owns the arrays. No external reference or saved copy
++		// retains their CowData and forces repeated CPU-buffer copies.
++		if (ObjectDB::get_instance(entry.key) != upload.owner) {
++			++quarry_sprite_uploads.stale_owners;
++			continue;
++		}
++		quarry_sprite_submit_pair(upload.mesh, *upload.vertices, *upload.attributes, report ? &quarry_sprite_uploads.draw_submit_us : nullptr);
++		++quarry_sprite_uploads.flushed_uploads;
++	}
++	quarry_sprite_uploads.pending.clear();
++}
++
++void quarry_report_sprite_uploads() {
++	if (!quarry_sprite_upload_report_enabled()) {
++		return;
++	}
++	const QuarrySpriteUploads &s = quarry_sprite_uploads;
++	print_line(vformat("QUARRY_SPRITE_UPLOAD batch=%d physics_requests=%d queued=%d coalesced=%d direct=%d draw=%d direct_replaced=%d destroyed=%d stale=%d pending_at_finish=%d draw_flushes=%d direct_qpc_us=%d draw_qpc_us=%d",
++			int(quarry_sprite_upload_enabled()), s.physics_upload_requests, s.queued_uploads, s.coalesced_uploads, s.direct_uploads, s.flushed_uploads,
++			s.canceled_by_direct, s.canceled_on_destroy, s.stale_owners, s.pending.size(), s.nonempty_flushes, s.direct_submit_us, s.draw_submit_us));
++}
++#endif // DEBUG_ENABLED
++
+ Color SpriteBase3D::_get_color_accum() {
+ 	if (!color_dirty) {
+ 		return color_accum;
+@@ -265,8 +357,36 @@ void SpriteBase3D::draw_texture_rect(Ref<Texture2D> p_texture, Rect2 p_dst_rect,
+ 	}
+ 
+ 	RID mesh_new = get_mesh();
+-	RS::get_singleton()->mesh_surface_update_vertex_region(mesh_new, 0, 0, vertex_buffer);
+-	RS::get_singleton()->mesh_surface_update_attribute_region(mesh_new, 0, 0, attribute_buffer);
++#ifdef DEBUG_ENABLED
++	const bool requested = quarry_sprite_upload_enabled();
++	const bool report_upload = quarry_sprite_upload_report_enabled();
++	if ((requested || report_upload) && Thread::is_main_thread()) {
++		const bool physics = Engine::get_singleton() && Engine::get_singleton()->is_in_physics_frame() && is_inside_tree();
++		if (physics) {
++			++quarry_sprite_uploads.physics_upload_requests;
++		}
++		if (requested && physics) {
++			const ObjectID id = get_instance_id();
++			if (quarry_sprite_uploads.pending.has(id)) {
++				++quarry_sprite_uploads.coalesced_uploads;
++			} else {
++				QuarrySpriteUpload upload = { this, mesh_new, &vertex_buffer, &attribute_buffer };
++				quarry_sprite_uploads.pending.insert(id, upload);
++			}
++			++quarry_sprite_uploads.queued_uploads;
++		} else {
++			if (requested && !quarry_sprite_uploads.pending.is_empty() && quarry_sprite_uploads.pending.erase(get_instance_id())) {
++				++quarry_sprite_uploads.canceled_by_direct;
++			}
++			quarry_sprite_submit_pair(mesh_new, vertex_buffer, attribute_buffer, report_upload ? &quarry_sprite_uploads.direct_submit_us : nullptr);
++			++quarry_sprite_uploads.direct_uploads;
++		}
++	} else
++#endif
++	{
++		RS::get_singleton()->mesh_surface_update_vertex_region(mesh_new, 0, 0, vertex_buffer);
++		RS::get_singleton()->mesh_surface_update_attribute_region(mesh_new, 0, 0, attribute_buffer);
++	}
+ 
+ 	RS::get_singleton()->mesh_set_custom_aabb(mesh_new, aabb_new);
+ 	set_aabb(aabb_new);
+@@ -424,6 +544,19 @@ void SpriteBase3D::_im_update() {
+ }
+ 
+ void SpriteBase3D::_queue_redraw() {
++#if 1 // Quarry release parity
++	static const bool crack_frame_batch = OS::get_singleton()->get_environment("QUARRY_PROBE_CRACK_FRAME_BATCH") == "1";
++	// The private Block driver sets this only around the stock Frame setter
++	// in frame_pre_draw. The global MessageQueue has already drained; draw
++	// the targeted sprite now instead of delaying its quad one real frame.
++	if (crack_frame_batch && Thread::is_main_thread() && !Engine::get_singleton()->is_in_physics_frame() &&
++			has_meta(SNAME("_quarry_crack_draw_now"))) {
++		triangle_mesh.unref();
++		update_gizmos();
++		_im_update();
++		return;
++	}
++#endif
+ 	// The 3D equivalent of CanvasItem.queue_redraw().
+ 	if (pending_update) {
+ 		return;
+@@ -610,6 +743,9 @@ StandardMaterial3D::TextureFilter SpriteBase3D::get_texture_filter() const {
+ }
+ 
+ void SpriteBase3D::_bind_methods() {
++#ifdef DEBUG_ENABLED
++	ClassDB::bind_integer_constant(get_class_static(), StringName(), SNAME("QUARRY_CRACK_FRAME_BATCH_ABI"), 1);
++#endif
+ 	ClassDB::bind_method(D_METHOD("set_centered", "centered"), &SpriteBase3D::set_centered);
+ 	ClassDB::bind_method(D_METHOD("is_centered"), &SpriteBase3D::is_centered);
+ 
+@@ -771,6 +907,11 @@ SpriteBase3D::SpriteBase3D() {
+ }
+ 
+ SpriteBase3D::~SpriteBase3D() {
++#ifdef DEBUG_ENABLED
++	if (quarry_sprite_upload_enabled() && Thread::is_main_thread() && !quarry_sprite_uploads.pending.is_empty()) {
++		quarry_sprite_uploads.canceled_on_destroy += quarry_sprite_uploads.pending.erase(get_instance_id());
++	}
++#endif
+ 	ERR_FAIL_NULL(RenderingServer::get_singleton());
+ 	RenderingServer::get_singleton()->free(mesh);
+ 	RenderingServer::get_singleton()->free(material);
+diff --git a/scene/3d/visual_instance_3d.cpp b/scene/3d/visual_instance_3d.cpp
+index 41903f2..6a0e5fa 100644
+--- a/scene/3d/visual_instance_3d.cpp
++++ b/scene/3d/visual_instance_3d.cpp
+@@ -30,7 +30,10 @@
+ 
+ #include "visual_instance_3d.h"
+ 
++#include "core/config/engine.h"
+ #include "core/config/project_settings.h"
++#include "core/os/thread.h"
++#include "scene/3d/sprite_3d.h"
+ 
+ AABB VisualInstance3D::get_aabb() const {
+ 	AABB ret;
+@@ -38,6 +41,27 @@ AABB VisualInstance3D::get_aabb() const {
+ 	return ret;
+ }
+ 
++bool VisualInstance3D::_quarry_set_render_transform_coalescing(bool p_enabled) {
++	if (!Thread::is_main_thread() || (p_enabled && (Engine::get_singleton()->is_editor_hint() || !Object::cast_to<Sprite3D>(this)))) {
++		return false;
++	}
++	if (!p_enabled && quarry_transform_pending) {
++		_quarry_flush_render_transform(is_inside_tree() ? get_tree() : nullptr);
++	}
++	quarry_coalesce_transform = p_enabled;
++	return true;
++}
++
++void VisualInstance3D::_quarry_flush_render_transform(const SceneTree *p_tree) {
++	if (!quarry_transform_pending) {
++		return;
++	}
++	quarry_transform_pending = false;
++	if (p_tree && _is_vi_visible() && !_is_using_identity_transform() && is_inside_tree() && get_tree() == p_tree && !p_tree->is_physics_interpolation_enabled()) {
++		RenderingServer::get_singleton()->instance_set_transform(instance, get_global_transform());
++	}
++}
++
+ void VisualInstance3D::_update_visibility() {
+ 	if (!is_inside_tree()) {
+ 		return;
+@@ -45,6 +69,10 @@ void VisualInstance3D::_update_visibility() {
+ 
+ 	bool already_visible = _is_vi_visible();
+ 	bool visible = is_visible_in_tree();
++	if (visible != already_visible) {
++		// The normal show path writes the current position immediately.
++		quarry_transform_pending = false;
++	}
+ 	_set_vi_visible(visible);
+ 
+ 	// If making visible, make sure the rendering server is up to date with the transform.
+@@ -60,6 +88,7 @@ void VisualInstance3D::_update_visibility() {
+ 
+ void VisualInstance3D::set_instance_use_identity_transform(bool p_enable) {
+ 	// Prevent sending instance transforms when using global coordinates.
++	quarry_transform_pending = false;
+ 	_set_use_identity_transform(p_enable);
+ 
+ 	if (is_inside_tree()) {
+@@ -74,6 +103,7 @@ void VisualInstance3D::set_instance_use_identity_transform(bool p_enable) {
+ }
+ 
+ void VisualInstance3D::fti_update_servers_xform() {
++	quarry_transform_pending = false;
+ 	if (!_is_using_identity_transform()) {
+ 		RS::get_singleton()->instance_set_transform(get_instance(), _get_cached_global_transform_interpolated());
+ 	}
+@@ -90,7 +120,14 @@ void VisualInstance3D::_notification(int p_what) {
+ 		case NOTIFICATION_TRANSFORM_CHANGED: {
+ 			// ToDo : Can we turn off notify transform for physics interpolated cases?
+ 			if (_is_vi_visible() && !(is_inside_tree() && get_tree()->is_physics_interpolation_enabled()) && !_is_using_identity_transform()) {
+-				// Physics interpolation global off, always send.
++				if (quarry_coalesce_transform && Thread::is_main_thread() && is_inside_tree() && Engine::get_singleton()->is_in_physics_frame()) {
++					if (!quarry_transform_pending) {
++						quarry_transform_pending = true;
++						get_tree()->quarry_render_transforms.push_back(get_instance_id());
++					}
++					break;
++				}
++				quarry_transform_pending = false;
+ 				RenderingServer::get_singleton()->instance_set_transform(instance, get_global_transform());
+ 			}
+ 		} break;
+@@ -100,11 +137,14 @@ void VisualInstance3D::_notification(int p_what) {
+ 				// Allow resetting motion vectors etc
+ 				// at the same time as resetting physics interpolation,
+ 				// giving users one common interface.
++				// A discontinuity retains the normal ordering: position, then teleport.
++				_quarry_flush_render_transform(get_tree());
+ 				RenderingServer::get_singleton()->instance_teleport(instance);
+ 			}
+ 		} break;
+ 
+ 		case NOTIFICATION_EXIT_WORLD: {
++			quarry_transform_pending = false;
+ 			RenderingServer::get_singleton()->instance_set_scenario(instance, RID());
+ 			RenderingServer::get_singleton()->instance_attach_skeleton(instance, RID());
+ 			_set_vi_visible(false);
+@@ -172,6 +212,7 @@ void VisualInstance3D::_validate_property(PropertyInfo &p_property) const {
+ }
+ 
+ void VisualInstance3D::_bind_methods() {
++	ClassDB::bind_method(D_METHOD("_quarry_set_render_transform_coalescing", "enabled"), &VisualInstance3D::_quarry_set_render_transform_coalescing);
+ 	ClassDB::bind_method(D_METHOD("set_base", "base"), &VisualInstance3D::set_base);
+ 	ClassDB::bind_method(D_METHOD("get_base"), &VisualInstance3D::get_base);
+ 	ClassDB::bind_method(D_METHOD("get_instance"), &VisualInstance3D::get_instance);
+diff --git a/scene/3d/visual_instance_3d.h b/scene/3d/visual_instance_3d.h
+index 727066a..85e893e 100644
+--- a/scene/3d/visual_instance_3d.h
++++ b/scene/3d/visual_instance_3d.h
+@@ -40,6 +40,12 @@ class VisualInstance3D : public Node3D {
+ 	uint32_t layers = 1;
+ 	float sorting_offset = 0.0;
+ 	bool sorting_use_aabb_center = true;
++	// Private experiment: only individually opted-in Sprite3D nodes stage updates.
++	bool quarry_coalesce_transform = false;
++	bool quarry_transform_pending = false;
++	friend class SceneTree;
++	void _quarry_flush_render_transform(const SceneTree *p_tree);
++	bool _quarry_set_render_transform_coalescing(bool p_enabled);
+ 
+ protected:
+ 	void _update_visibility();
+diff --git a/scene/animation/animation_player.cpp b/scene/animation/animation_player.cpp
+index 8f20dd5..65c4361 100644
+--- a/scene/animation/animation_player.cpp
++++ b/scene/animation/animation_player.cpp
+@@ -28,11 +28,191 @@
+ /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+ /**************************************************************************/
+ 
++#define QUARRY_ANIMATION_REPEAT_ATTRIBUTION
++
+ #include "animation_player.h"
+ #include "animation_player.compat.inc"
+ 
+ #include "core/config/engine.h"
+ 
++#ifdef QUARRY_ANIMATION_REPEAT_ATTRIBUTION
++#include "core/io/json.h"
++#include "core/os/os.h"
++#include "core/os/thread.h"
++#include "core/os/time.h"
++#include "core/string/print_string.h"
++#endif
++
++#ifdef QUARRY_ANIMATION_REPEAT_ATTRIBUTION
++namespace {
++
++enum QuarryPlayMode {
++	QUARRY_PLAY_OFF,
++	QUARRY_PLAY_COUNTS,
++	QUARRY_PLAY_SAMPLE,
++	QUARRY_PLAY_CLOCK,
++};
++
++enum QuarryPlayOutcome {
++	QUARRY_PLAY_STRICT_DUPLICATE,
++	QUARRY_PLAY_OTHER_EARLY_RETURN,
++	QUARRY_PLAY_OTHER,
++	QUARRY_PLAY_OUTCOMES,
++};
++
++constexpr const char *quarry_play_outcomes[] = { "strict_duplicate", "other_early_return", "other" };
++constexpr uint64_t quarry_play_stride = 32;
++static_assert(sizeof(quarry_play_outcomes) / sizeof(*quarry_play_outcomes) == QUARRY_PLAY_OUTCOMES);
++
++struct QuarryPlayBucket {
++	uint64_t calls = 0;
++	uint64_t nested = 0;
++	uint64_t outer_with_nested = 0;
++	uint64_t outer_samples = 0;
++	uint64_t outer_qpc_us = 0;
++	uint64_t outer_max_qpc_us = 0;
++};
++
++struct QuarryPlayWitness;
++thread_local QuarryPlayMode quarry_play_mode = QUARRY_PLAY_OFF;
++thread_local QuarryPlayWitness *quarry_play_current = nullptr;
++uint64_t quarry_play_open = 0;
++uint64_t quarry_play_ordinals[2] = {};
++QuarryPlayBucket quarry_play_buckets[2][QUARRY_PLAY_OUTCOMES];
++
++_FORCE_INLINE_ uint64_t quarry_play_stamp() {
++	return Time::get_singleton()->get_ticks_usec();
++}
++
++struct QuarryPlayWitness {
++	QuarryPlayWitness *const previous = quarry_play_current;
++	const AnimationPlayer *const player;
++	const bool physics = Engine::get_singleton()->is_in_physics_frame();
++	bool strict_guard = false;
++	bool capturing = false;
++	bool reached_section = false;
++	bool early_return = false;
++	bool has_nested = false;
++	bool sampled = false;
++	uint64_t begin = 0;
++
++	explicit QuarryPlayWitness(const AnimationPlayer *p_player) :
++			player(p_player) {
++		quarry_play_current = this;
++		if (previous) {
++			previous->has_nested = true;
++		}
++	}
++
++	_FORCE_INLINE_ void start() {
++		if (previous) {
++			return;
++		}
++		const uint64_t ordinal = quarry_play_ordinals[physics]++;
++		const uint32_t block = uint32_t(ordinal / quarry_play_stride);
++		const uint32_t offset = ((block * 0x9E3779B9u) ^ (block >> 2)) >> 27;
++		sampled = quarry_play_mode == QUARRY_PLAY_CLOCK ||
++				(quarry_play_mode == QUARRY_PLAY_SAMPLE && ordinal % quarry_play_stride == offset);
++		if (sampled) {
++			begin = quarry_play_stamp();
++		}
++	}
++
++	~QuarryPlayWitness() {
++		const uint64_t elapsed = sampled ? quarry_play_stamp() - begin : 0;
++		quarry_play_current = previous;
++		const auto outcome = early_return ? (strict_guard && !has_nested ? QUARRY_PLAY_STRICT_DUPLICATE : QUARRY_PLAY_OTHER_EARLY_RETURN) : QUARRY_PLAY_OTHER;
++		QuarryPlayBucket &bucket = quarry_play_buckets[physics][outcome];
++		++bucket.calls;
++		if (previous) {
++			++bucket.nested;
++		} else {
++			bucket.outer_with_nested += has_nested;
++			if (sampled) {
++				++bucket.outer_samples;
++				bucket.outer_qpc_us += elapsed;
++				bucket.outer_max_qpc_us = MAX(bucket.outer_max_qpc_us, elapsed);
++			}
++		}
++	}
++};
++
++// Ignore direct play_section callers and indirect section calls from capture or
++// callbacks: only the first ordinary play_section reached from this play counts.
++_FORCE_INLINE_ QuarryPlayWitness *quarry_play_claim(const AnimationPlayer *p_player) {
++	QuarryPlayWitness *const witness = quarry_play_current;
++	if (!witness || witness->player != p_player || witness->capturing || witness->reached_section) {
++		return nullptr;
++	}
++	witness->reached_section = true;
++	return witness;
++}
++
++bool quarry_play_window(bool p_active) {
++	if (!Thread::is_main_thread() || quarry_play_current) {
++		return false;
++	}
++	if (p_active) {
++		if (quarry_play_mode != QUARRY_PLAY_OFF) {
++			return false;
++		}
++		OS *os = OS::get_singleton();
++		const String mode = os->get_environment("QUARRY_PROBE_ANIMATION_REPEAT");
++		const String appdata = os->get_environment("APPDATA").replace("\\", "/").simplify_path();
++		const String control = os->get_environment("QUARRY_CONTROL_DIR").replace("\\", "/").simplify_path();
++		if ((mode != "count" && mode != "sample" && mode != "clock") ||
++				os->get_environment("QUARRY_TEST_PROFILE") != "1" ||
++				os->get_environment("QUARRY_PROBE_NO_SAVE") != "1" ||
++				os->get_environment("QUARRY_PROBE_QUIT_AFTER_ACTIVE") != "1" ||
++				!appdata.is_absolute_path() || !control.is_absolute_path() ||
++				!appdata.contains("/rollover-probe/mailbox-") || !control.contains("/rollover-probe/mailbox-")) {
++			return false;
++		}
++		for (int phase = 0; phase < 2; ++phase) {
++			quarry_play_ordinals[phase] = 0;
++			for (QuarryPlayBucket &bucket : quarry_play_buckets[phase]) {
++				bucket = QuarryPlayBucket();
++			}
++		}
++		quarry_play_open = quarry_play_stamp();
++		quarry_play_mode = mode == "sample" ? QUARRY_PLAY_SAMPLE : (mode == "clock" ? QUARRY_PLAY_CLOCK : QUARRY_PLAY_COUNTS);
++		return true;
++	}
++	if (quarry_play_mode == QUARRY_PLAY_OFF) {
++		return false;
++	}
++	const QuarryPlayMode previous = quarry_play_mode;
++	quarry_play_mode = QUARRY_PLAY_OFF;
++	const uint64_t close = quarry_play_stamp();
++	Array rows;
++	for (int phase = 0; phase < 2; ++phase) {
++		for (int outcome = 0; outcome < QUARRY_PLAY_OUTCOMES; ++outcome) {
++			const QuarryPlayBucket &bucket = quarry_play_buckets[phase][outcome];
++			Dictionary row;
++			row["phase"] = phase ? "physics" : "outside_physics";
++			row["outcome"] = quarry_play_outcomes[outcome];
++			row["calls"] = bucket.calls;
++			row["nested"] = bucket.nested;
++			row["outer_with_nested"] = bucket.outer_with_nested;
++			row["outer_samples"] = bucket.outer_samples;
++			row["outer_qpc_us"] = bucket.outer_qpc_us;
++			row["outer_max_qpc_us"] = bucket.outer_max_qpc_us;
++			rows.push_back(row);
++		}
++	}
++	Dictionary result;
++	result["mode"] = previous == QUARRY_PLAY_SAMPLE ? "sample" : (previous == QUARRY_PLAY_CLOCK ? "clock" : "count");
++	result["stride"] = previous == QUARRY_PLAY_SAMPLE ? quarry_play_stride : uint64_t(1);
++	result["begin_qpc_us"] = quarry_play_open;
++	result["end_qpc_us"] = close;
++	result["rows"] = rows;
++	print_line("QUARRY_ANIMATION_REPEAT_ATTRIBUTION " + JSON::stringify(result));
++	return true;
++}
++
++} // namespace
++#endif
++
+ bool AnimationPlayer::_set(const StringName &p_name, const Variant &p_value) {
+ 	String name = p_name;
+ 	if (name.begins_with("playback/play")) { // For backward compatibility.
+@@ -391,11 +571,34 @@ void AnimationPlayer::play_section_backwards(const StringName &p_name, double p_
+ }
+ 
+ void AnimationPlayer::play(const StringName &p_name, double p_custom_blend, float p_custom_scale, bool p_from_end) {
++#ifdef QUARRY_ANIMATION_REPEAT_ATTRIBUTION
++	const auto stock_play = [&]() {
++#endif
+ 	if (auto_capture) {
+ 		play_with_capture(p_name, auto_capture_duration, p_custom_blend, p_custom_scale, p_from_end, auto_capture_transition_type, auto_capture_ease_type);
+ 	} else {
+ 		_play(p_name, p_custom_blend, p_custom_scale, p_from_end);
+ 	}
++#ifdef QUARRY_ANIMATION_REPEAT_ATTRIBUTION
++	};
++	if (likely(quarry_play_mode == QUARRY_PLAY_OFF)) {
++		stock_play();
++		return;
++	}
++	QuarryPlayWitness witness(this);
++	// Narrow neutral subset: do not count a restart, remap, section, speed,
++	// capture, blend, or queue write as skippable just because stock returns early.
++	const PlaybackData &current = playback.current;
++	const AnimationData *const known = playing && p_name != StringName() && playback.assigned == p_name && current.from ? animation_set.getptr(p_name) : nullptr;
++	witness.strict_guard = known && known == current.from && known->name == p_name && known->animation.is_valid() &&
++			p_custom_blend == -1.0 && p_custom_scale == 1.0f && !p_from_end && current.speed_scale == 1.0f &&
++			current.start_time == -1.0 && current.end_time == -1.0 && !end_reached &&
++			blend_times.is_empty() && default_blend_time == 0.0 && playback.blend.is_empty() && playback_queue.is_empty() &&
++			(!auto_capture || !known->animation->is_capture_included()) &&
++			!Math::is_equal_approx(current.pos, current.get_end_time());
++	witness.start();
++	stock_play();
++#endif
+ }
+ 
+ void AnimationPlayer::_play(const StringName &p_name, double p_custom_blend, float p_custom_scale, bool p_from_end) {
+@@ -433,6 +636,9 @@ void AnimationPlayer::play_section_with_markers(const StringName &p_name, const
+ }
+ 
+ void AnimationPlayer::play_section(const StringName &p_name, double p_start_time, double p_end_time, double p_custom_blend, float p_custom_scale, bool p_from_end) {
++#ifdef QUARRY_ANIMATION_REPEAT_ATTRIBUTION
++	QuarryPlayWitness *const quarry_witness = quarry_play_claim(this);
++#endif
+ 	StringName name = p_name;
+ 
+ 	if (name == StringName()) {
+@@ -512,6 +718,11 @@ void AnimationPlayer::play_section(const StringName &p_name, double p_start_time
+ 			// Animation resumed but already ended, set position to the beginning.
+ 			seek_internal(start, true, true, true);
+ 		} else if (playing) {
++#ifdef QUARRY_ANIMATION_REPEAT_ATTRIBUTION
++			if (quarry_witness) {
++				quarry_witness->early_return = true;
++			}
++#endif
+ 			return;
+ 		}
+ 	}
+@@ -571,7 +782,20 @@ void AnimationPlayer::_capture(const StringName &p_name, bool p_from_end, double
+ }
+ 
+ void AnimationPlayer::play_with_capture(const StringName &p_name, double p_duration, double p_custom_blend, float p_custom_scale, bool p_from_end, Tween::TransitionType p_trans_type, Tween::EaseType p_ease_type) {
++#ifdef QUARRY_ANIMATION_REPEAT_ATTRIBUTION
++	QuarryPlayWitness *const quarry_witness = quarry_play_current;
++	const bool quarry_owns_capture = quarry_witness && quarry_witness->player == this &&
++			!quarry_witness->capturing && !quarry_witness->reached_section;
++	if (quarry_owns_capture) {
++		quarry_witness->capturing = true;
++	}
++#endif
+ 	_capture(p_name, p_from_end, p_duration, p_trans_type, p_ease_type);
++#ifdef QUARRY_ANIMATION_REPEAT_ATTRIBUTION
++	if (quarry_owns_capture) {
++		quarry_witness->capturing = false;
++	}
++#endif
+ 	_play(p_name, p_custom_blend, p_custom_scale, p_from_end);
+ }
+ 
+@@ -949,6 +1173,9 @@ void AnimationPlayer::_rename_animation(const StringName &p_from_name, const Str
+ }
+ 
+ void AnimationPlayer::_bind_methods() {
++#ifdef QUARRY_ANIMATION_REPEAT_ATTRIBUTION
++	ClassDB::bind_static_method(get_class_static(), D_METHOD("_quarry_repeat_play_window", "active"), &quarry_play_window);
++#endif
+ 	ClassDB::bind_method(D_METHOD("animation_set_next", "animation_from", "animation_to"), &AnimationPlayer::animation_set_next);
+ 	ClassDB::bind_method(D_METHOD("animation_get_next", "animation_from"), &AnimationPlayer::animation_get_next);
+ 
+diff --git a/scene/main/node.cpp b/scene/main/node.cpp
+index 7bad977..6e7bfbf 100644
+--- a/scene/main/node.cpp
++++ b/scene/main/node.cpp
+@@ -30,6 +30,7 @@
+ 
+ #include "node.h"
+ #include "node.compat.inc"
++#include "quarry_delete_profiler.h"
+ 
+ #include "core/config/project_settings.h"
+ #include "core/io/resource_loader.h"
+@@ -44,6 +45,10 @@
+ #include "scene/resources/packed_scene.h"
+ #include "viewport.h"
+ 
++#if 1 // Quarry release parity
++void quarry_mark_process_child_order_changed(SceneTree *p_tree);
++#endif
++
+ int Node::orphan_node_count = 0;
+ 
+ thread_local Node *Node::current_process_thread_group = nullptr;
+@@ -267,6 +272,7 @@ void Node::_notification(int p_notification) {
+ 		} break;
+ 
+ 		case NOTIFICATION_PREDELETE: {
++			QUARRY_DELETE_SCOPE(PREDELETE);
+ 			if (data.tree && !Thread::is_main_thread()) {
+ 				cancel_free();
+ 				ERR_PRINT("Attempted to free a node that is currently added to the SceneTree from a thread. This is not permitted, use queue_free() instead. Node has not been freed.");
+@@ -289,6 +295,42 @@ void Node::_notification(int p_notification) {
+ 			// kill children as cleanly as possible
+ 			while (data.children.size()) {
+ 				Node *child = data.children.last()->value; // begin from the end because its faster and more consistent with creation
++#ifdef DEBUG_ENABLED
++				QuarryDelete::Site child_site = QuarryDelete::DESTROY_CHILD;
++				if (QuarryDelete::current) {
++					const StringName &child_class = child->get_class_name();
++					if (child_class == SNAME("Sprite3D")) {
++						child_site = QuarryDelete::DESTROY_CHILD_SPRITE3D;
++					} else if (child_class == SNAME("AnimatedSprite3D")) {
++						child_site = QuarryDelete::DESTROY_CHILD_ANIMATEDSPRITE3D;
++					} else if (child_class == SNAME("GPUParticles3D")) {
++						child_site = QuarryDelete::DESTROY_CHILD_GPUPARTICLES3D;
++					} else if (child_class == SNAME("CPUParticles3D")) {
++						child_site = QuarryDelete::DESTROY_CHILD_CPUPARTICLES3D;
++					} else if (child_class == SNAME("AnimationPlayer")) {
++						child_site = QuarryDelete::DESTROY_CHILD_ANIMATIONPLAYER;
++					} else if (child_class == SNAME("AnimationTree")) {
++						child_site = QuarryDelete::DESTROY_CHILD_ANIMATIONTREE;
++					} else if (child_class == SNAME("Timer")) {
++						child_site = QuarryDelete::DESTROY_CHILD_TIMER;
++					} else if (child_class == SNAME("CollisionShape3D")) {
++						child_site = QuarryDelete::DESTROY_CHILD_COLLISIONSHAPE3D;
++					} else if (child_class == SNAME("Area3D")) {
++						child_site = QuarryDelete::DESTROY_CHILD_AREA3D;
++					} else if (child_class == SNAME("MeshInstance3D")) {
++						child_site = QuarryDelete::DESTROY_CHILD_MESHINSTANCE3D;
++					} else if (child_class == SNAME("OmniLight3D")) {
++						child_site = QuarryDelete::DESTROY_CHILD_OMNILIGHT3D;
++					} else if (child_class == SNAME("AudioStreamPlayer3D")) {
++						child_site = QuarryDelete::DESTROY_CHILD_AUDIOSTREAMPLAYER3D;
++					} else if (child_class == SNAME("AudioStreamPlayer")) {
++						child_site = QuarryDelete::DESTROY_CHILD_AUDIOSTREAMPLAYER;
++					} else if (child_class == SNAME("Node3D")) {
++						child_site = QuarryDelete::DESTROY_CHILD_NODE3D;
++					}
++				}
++				QuarryDelete::Scope quarry_delete_child(child_site);
++#endif
+ 				memdelete(child);
+ 			}
+ 		} break;
+@@ -370,6 +412,7 @@ void Node::_propagate_enter_tree() {
+ }
+ 
+ void Node::_propagate_after_exit_tree() {
++	QUARRY_DELETE_SCOPE(AFTER_EXIT_TREE);
+ 	// Clear owner if it was not part of the pruned branch
+ 	if (data.owner) {
+ 		if (!data.owner->is_ancestor_of(this)) {
+@@ -389,6 +432,7 @@ void Node::_propagate_after_exit_tree() {
+ }
+ 
+ void Node::_propagate_exit_tree() {
++	QUARRY_DELETE_SCOPE(EXIT_TREE);
+ 	//block while removing children
+ 
+ #ifdef DEBUG_ENABLED
+@@ -405,11 +449,17 @@ void Node::_propagate_exit_tree() {
+ 
+ 	data.blocked--;
+ 
+-	GDVIRTUAL_CALL(_exit_tree);
++	{
++		QUARRY_DELETE_SCOPE(EXIT_SCRIPT_AND_SIGNAL);
++		GDVIRTUAL_CALL(_exit_tree);
+ 
+-	emit_signal(SceneStringName(tree_exiting));
++		emit_signal(SceneStringName(tree_exiting));
++	}
+ 
+-	notification(NOTIFICATION_EXIT_TREE, true);
++	{
++		QUARRY_DELETE_SCOPE(EXIT_NOTIFICATION);
++		notification(NOTIFICATION_EXIT_TREE, true);
++	}
+ 	if (data.tree) {
+ 		data.tree->node_removed(this);
+ 	}
+@@ -539,6 +589,12 @@ void Node::_move_child(Node *p_child, int p_index, bool p_ignore_end) {
+ 	int motion_from = MIN(p_index, child_index);
+ 	int motion_to = MAX(p_index, child_index);
+ 
++#if 1 // Quarry release parity
++	if (data.tree) {
++		quarry_mark_process_child_order_changed(data.tree);
++	}
++#endif
++
+ 	data.children_cache.remove_at(child_index);
+ 	data.children_cache.insert(p_index, p_child);
+ 
+@@ -1713,6 +1769,7 @@ void Node::add_sibling(Node *p_sibling, bool p_force_readable_name) {
+ }
+ 
+ void Node::remove_child(Node *p_child) {
++	QUARRY_DELETE_SCOPE(REMOVE_CHILD);
+ 	ERR_FAIL_COND_MSG(data.tree && !Thread::is_main_thread(), "Removing children from a node inside the SceneTree is only allowed from the main thread. Use call_deferred(\"remove_child\",node).");
+ 	ERR_FAIL_NULL(p_child);
+ 	ERR_FAIL_COND_MSG(data.blocked > 0, "Parent node is busy adding/removing children, `remove_child()` can't be called at this time. Consider using `remove_child.call_deferred(child)` instead.");
+@@ -2093,6 +2150,50 @@ bool Node::is_greater_than(const Node *p_node) const {
+ 	ERR_FAIL_COND_V(data.depth < 0, false);
+ 	ERR_FAIL_COND_V(p_node->data.depth < 0, false);
+ 
++	// Within one SceneTree, the first unequal path index is the index of
++	// the two siblings immediately below their shared ancestor.
++	if (data.tree == p_node->data.tree && data.depth > 0 && p_node->data.depth > 0) {
++		const auto parent_for_order = [](const Node *p_child) -> const Node * {
++			if (p_child->data.depth <= 1 || p_child->data.internal_mode != INTERNAL_MODE_DISABLED) {
++				return nullptr;
++			}
++			const Node *parent = p_child->data.parent;
++			if (!parent || parent->data.tree != p_child->data.tree || parent->data.depth != p_child->data.depth - 1) {
++				return nullptr;
++			}
++			return parent;
++		};
++
++		const Node *left = this;
++		const Node *right = p_node;
++		while (left && left->data.depth > right->data.depth) {
++			left = parent_for_order(left);
++		}
++		while (left && right && right->data.depth > left->data.depth) {
++			right = parent_for_order(right);
++		}
++		if (left && right) {
++			if (left == right && left->data.internal_mode == INTERNAL_MODE_DISABLED) {
++				// An ancestor's path is a strict prefix of a descendant's.
++				return data.depth > p_node->data.depth;
++			}
++			while (left && right && left != right) {
++				const Node *left_parent = parent_for_order(left);
++				const Node *right_parent = parent_for_order(right);
++				if (left_parent && left_parent == right_parent) {
++					const int left_index = left->get_index(true);
++					const int right_index = right->get_index(true);
++					if (left_index >= 0 && right_index >= 0 && left_index != right_index) {
++						return left_index > right_index;
++					}
++					break;
++				}
++				left = left_parent;
++				right = right_parent;
++			}
++		}
++	}
++
+ 	_update_children_cache();
+ 
+ 	int *this_stack = (int *)alloca(sizeof(int) * data.depth);
+diff --git a/scene/main/scene_tree.cpp b/scene/main/scene_tree.cpp
+index 4c13700..c94dd13 100644
+--- a/scene/main/scene_tree.cpp
++++ b/scene/main/scene_tree.cpp
+@@ -28,9 +28,17 @@
+ /* SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.                 */
+ /**************************************************************************/
+ 
++#define QUARRY_NATIVE_TRANSFORM_ATTRIBUTION
++
+ #include "scene_tree.h"
+ 
++#ifdef DEBUG_ENABLED
++void quarry_profile_scene_frame_signal(Object *p_tree, const StringName &p_signal, bool p_physics, bool p_timer = false);
++void quarry_publish_scene_frame_signals();
++#endif
++
+ #include "core/config/project_settings.h"
++#include "core/debugger/engine_debugger.h"
+ #include "core/input/input.h"
+ #include "core/io/image_loader.h"
+ #include "core/io/resource_loader.h"
+@@ -38,6 +46,21 @@
+ #include "core/object/worker_thread_pool.h"
+ #include "core/os/os.h"
+ #include "node.h"
++#include "quarry_delete_profiler.h"
++#ifdef DEBUG_ENABLED
++#include "core/object/script_language.h"
++#include "scene/animation/animation_player.h"
++#include "scene/main/timer.h"
++#endif
++#ifdef QUARRY_NATIVE_TRANSFORM_ATTRIBUTION
++#include "core/config/engine.h"
++#include "core/io/json.h"
++#include "core/object/script_language.h"
++#include "core/os/thread.h"
++#include "core/os/time.h"
++#include "core/string/print_string.h"
++#include <type_traits>
++#endif
+ #include "scene/animation/tween.h"
+ #include "scene/debugger/scene_debugger.h"
+ #include "scene/gui/control.h"
+@@ -53,6 +76,7 @@
+ 
+ #ifndef _3D_DISABLED
+ #include "scene/3d/node_3d.h"
++#include "scene/3d/visual_instance_3d.h"
+ #include "scene/resources/3d/world_3d.h"
+ #endif // _3D_DISABLED
+ 
+@@ -64,6 +88,283 @@
+ #include "servers/physics_server_3d.h"
+ #endif // PHYSICS_3D_DISABLED
+ 
++
++#include <atomic>
++#include <cstring>
++
++#ifdef DEBUG_ENABLED
++
++namespace {
++
++// All four buckets are independently aggregated. No lock or clock per node
++// or comparator; one publication per nonempty _process_group.
++struct QuarrySceneOrder {
++	struct Bucket {
++		std::atomic<uint64_t> nonempty_groups{ 0 };
++		std::atomic<uint64_t> nodes_visited{ 0 };
++		std::atomic<uint64_t> dirty_sorts{ 0 };
++		std::atomic<uint64_t> nodes_in_sorts{ 0 };
++		std::atomic<uint64_t> sort_us{ 0 };
++		std::atomic<uint64_t> notification_loop_us{ 0 };
++	};
++
++	std::atomic<bool> armed{ false };
++	Bucket buckets[4];
++
++	void arm() {
++		static const bool enable_requested = OS::get_singleton()->get_environment("QUARRY_SCENE_ORDER_PROFILE") == "1";
++		if (!enable_requested) {
++			return;
++		}
++		const bool on = EngineDebugger::is_active() && EngineDebugger::is_profiling(SNAME("servers"));
++		if (armed.load(std::memory_order_relaxed) != on) {
++			armed.store(on, std::memory_order_relaxed);
++			if (!on) {
++				// Current group work has already been joined. Do not leak a
++				// partial outer frame across profiler windows.
++				for (Bucket &bucket : buckets) {
++					bucket.nonempty_groups.store(0, std::memory_order_relaxed);
++					bucket.nodes_visited.store(0, std::memory_order_relaxed);
++					bucket.dirty_sorts.store(0, std::memory_order_relaxed);
++					bucket.nodes_in_sorts.store(0, std::memory_order_relaxed);
++					bucket.sort_us.store(0, std::memory_order_relaxed);
++					bucket.notification_loop_us.store(0, std::memory_order_relaxed);
++				}
++			}
++		}
++	}
++
++	void record(bool p_physics, bool p_dirty, uint64_t p_nodes, uint64_t p_sort_us, uint64_t p_loop_us) {
++		const int role = Thread::is_main_thread() ? 0 : 1;
++		Bucket &bucket = buckets[(p_physics ? 0 : 2) + role];
++		bucket.nonempty_groups.fetch_add(1, std::memory_order_relaxed);
++		bucket.nodes_visited.fetch_add(p_nodes, std::memory_order_relaxed);
++		if (p_dirty) {
++			bucket.dirty_sorts.fetch_add(1, std::memory_order_relaxed);
++			bucket.nodes_in_sorts.fetch_add(p_nodes, std::memory_order_relaxed);
++			bucket.sort_us.fetch_add(p_sort_us, std::memory_order_relaxed);
++		}
++		bucket.notification_loop_us.fetch_add(p_loop_us, std::memory_order_relaxed);
++	}
++
++	void flush_on_idle() {
++		if (!armed.load(std::memory_order_relaxed)) {
++			return;
++		}
++		Array elapsed;
++		Array counts;
++		elapsed.append("scene_quarry_order_times");
++		counts.append("scene_quarry_order_counts");
++		const char *phase_names[] = { "physics_main", "physics_worker", "idle_main", "idle_worker" };
++		for (int i = 0; i < 4; ++i) {
++			const String prefix = String(phase_names[i]) + "_";
++			Bucket &bucket = buckets[i];
++			auto append = [&](Array &p_packet, const char *p_name, std::atomic<uint64_t> &p_counter, double p_multiplier = 1.0) {
++				p_packet.append(prefix + p_name);
++				p_packet.append(double(p_counter.exchange(0, std::memory_order_relaxed)) * p_multiplier);
++			};
++			append(counts, "nonempty_groups", bucket.nonempty_groups);
++			append(counts, "nodes_visited", bucket.nodes_visited);
++			append(counts, "dirty_sorts", bucket.dirty_sorts);
++			append(counts, "nodes_in_sorts", bucket.nodes_in_sorts);
++			append(elapsed, "sort", bucket.sort_us, 0.000001);
++			append(elapsed, "notification_loop", bucket.notification_loop_us, 0.000001);
++		}
++		EngineDebugger::profiler_add_frame_data(SNAME("servers"), elapsed);
++		EngineDebugger::profiler_add_frame_data(SNAME("servers"), counts);
++	}
++};
++
++QuarrySceneOrder quarry_scene_order;
++
++// Both phases use independent one-of-32 strata across group/outer-frame boundaries.
++// Only the selected main-thread notification reads a script/class or a clock.
++struct QuarryPhysicsNotifications {
++	struct Bucket {
++		uint64_t count = 0;
++		uint64_t elapsed_us = 0;
++	};
++
++	struct Phase {
++		uint64_t ordinal = 0;
++		uint64_t eligible = 0;
++		uint32_t random;
++		uint32_t pick = 0;
++		Bucket sampled;
++		Bucket overflow;
++		HashMap<String, Bucket> buckets;
++
++		explicit Phase(uint32_t p_seed) :
++				random(p_seed) {}
++
++		bool select() {
++			++eligible;
++			const uint32_t index = uint32_t(ordinal++) & 31;
++			if (index == 0) {
++				// Xorshift32, private state (never the game's random stream).
++				random ^= random << 13;
++				random ^= random >> 17;
++				random ^= random << 5;
++				pick = random >> 27;
++			}
++			return index == pick;
++		}
++
++		void clear_frame() {
++			eligible = 0;
++			sampled = Bucket{};
++			overflow = Bucket{};
++			buckets.clear();
++		}
++	};
++
++	bool armed = false;
++	bool details = false;
++	Phase internal{ 0x732ff088u };
++	Phase ordinary{ 0x9e3779b9u };
++
++	void arm_on_physics() {
++		static const bool requested = OS::get_singleton()->get_environment("QUARRY_SCENE_NOTIFICATION_SAMPLE") == "1";
++		armed = requested && EngineDebugger::is_active() && EngineDebugger::is_profiling(SNAME("servers"));
++		static const bool owner_requested = OS::get_singleton()->get_environment("QUARRY_SCENE_NOTIFICATION_DETAIL") == "1";
++		details = owner_requested;
++	}
++
++	static String attached_script_path(const Node *p_node) {
++		if (const ScriptInstance *script_instance = p_node->get_script_instance()) {
++			const Ref<Script> script = script_instance->get_script();
++			if (script.is_valid()) {
++				return script->get_path();
++			}
++		}
++		return String();
++	}
++
++	static String owner_detail(const Node *p_node, const char *p_state, const String &p_detail) {
++		// Nearest script-bearing or packed-scene ancestor, not an absolute tree path
++		// (multiple copies of the same Bomb/actor must share sample buckets).
++		const Node *owner = p_node->get_parent();
++		String script;
++		String scene;
++		for (; owner; owner = owner->get_parent()) {
++			script = attached_script_path(owner);
++			scene = owner->get_scene_file_path();
++			if (!script.is_empty() || !scene.is_empty()) {
++				break;
++			}
++		}
++		if (!owner) {
++			owner = p_node->get_owner();
++			if (!owner) {
++				owner = p_node->get_parent();
++			}
++		}
++		String relative;
++		for (const Node *current = p_node; current && current != owner; current = current->get_parent()) {
++			String segment = current->get_name();
++			// Godot generates @Class@sequence for unnamed children. Normalize the
++			// sequence only; authored node names and hierarchy remain distinguishable.
++			const int last_at = segment.rfind_char('@');
++			if (last_at > 0 && segment.begins_with("@") && segment.substr(last_at + 1).is_valid_int()) {
++				segment = segment.substr(0, last_at + 1) + "*";
++			}
++			relative = relative.is_empty() ? segment : segment + "/" + relative;
++		}
++		return "\t" + script + "\t" + scene + "\t" + relative + "\t" + p_state + "\t" + p_detail;
++	}
++
++	static String native_detail(Node *p_node) {
++		if (Timer *timer = Object::cast_to<Timer>(p_node)) {
++			const double time_left = timer->get_time_left();
++			if (timer->is_paused()) {
++				return owner_detail(p_node, "paused", String());
++			}
++			if (timer->get_timer_process_callback() != Timer::TIMER_PROCESS_PHYSICS) {
++				return owner_detail(p_node, "configured_idle", String());
++			}
++			const double delta = timer->is_ignoring_time_scale() ? Engine::get_singleton()->get_process_step() : timer->get_physics_process_delta_time();
++			// Public get_time_left() is clamped to zero. A scheduled repeating
++			// timer can have zero/negative debt while still internally processing.
++			return owner_detail(p_node, time_left > 0 ? "running_positive" : "scheduled_nonpositive", time_left < delta ? String("due") : String("wait"));
++		}
++		if (const AnimationPlayer *player = Object::cast_to<AnimationPlayer>(p_node)) {
++			const bool playing = player->is_playing();
++			const char *state = nullptr;
++			if (player->is_active()) {
++				state = playing ? "active_playing" : "active_not_playing";
++			} else {
++				state = playing ? "inactive_playing" : "inactive_not_playing";
++			}
++			return owner_detail(p_node, state, playing ? player->get_current_animation() : String());
++		}
++		return String();
++	}
++
++	void deliver_sample(Node *p_node, int p_what, Phase &r_phase) {
++		String label = p_node->get_class_name();
++		if (const ScriptInstance *script_instance = p_node->get_script_instance()) {
++			const Ref<Script> script = script_instance->get_script();
++			if (script.is_valid()) {
++				const String path = script->get_path();
++				label += "|" + (path.is_empty() ? String("<in-memory script>") : path);
++			}
++		}
++		if (details && p_what == Node::NOTIFICATION_INTERNAL_PHYSICS_PROCESS) {
++			label += native_detail(p_node);
++		}
++		// The inclusive time can include directly emitted signals. Do not
++		// touch p_node after notification: callbacks may remove or free it.
++		OS *os = OS::get_singleton();
++		const uint64_t begin = os->get_ticks_usec();
++		p_node->notification(p_what);
++		const uint64_t end = os->get_ticks_usec();
++		const uint64_t us = end >= begin ? end - begin : 0;
++		Bucket *row = r_phase.buckets.getptr(label);
++		if (!row) {
++			row = r_phase.buckets.size() < 96 ? &r_phase.buckets[label] : &r_phase.overflow;
++		}
++		++row->count;
++		row->elapsed_us += us;
++		++r_phase.sampled.count;
++		r_phase.sampled.elapsed_us += us;
++	}
++
++	void flush_on_idle() {
++		if (!internal.eligible && !ordinary.eligible) {
++			return;
++		}
++		if (armed && EngineDebugger::is_active() && EngineDebugger::is_profiling(SNAME("servers"))) {
++			Array times = { "scene_quarry_notification_times" };
++			Array counts = { "scene_quarry_notification_counts" };
++			auto append_phase = [&](const String &p_prefix, const Phase &p_phase) {
++				auto append = [&](const String &p_key, const Bucket &p_row) {
++					times.append(p_prefix + p_key);
++					times.append(double(p_row.elapsed_us) * 0.000001);
++					counts.append(p_prefix + p_key);
++					counts.append(double(p_row.count));
++				};
++				append("eligible", Bucket{ p_phase.eligible, 0 });
++				append("sampled", p_phase.sampled);
++				append("overflow", p_phase.overflow);
++				for (const KeyValue<String, Bucket> &entry : p_phase.buckets) {
++					append("node:" + entry.key, entry.value);
++				}
++			};
++			append_phase("internal_physics:", internal);
++			append_phase("physics:", ordinary);
++			EngineDebugger::profiler_add_frame_data(SNAME("servers"), times);
++			EngineDebugger::profiler_add_frame_data(SNAME("servers"), counts);
++		}
++		internal.clear_frame();
++		ordinary.clear_frame();
++	}
++};
++
++QuarryPhysicsNotifications quarry_physics_notifications;
++
++} // namespace
++#endif // DEBUG_ENABLED
++
+ void SceneTreeTimer::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("set_time_left", "time"), &SceneTreeTimer::set_time_left);
+ 	ClassDB::bind_method(D_METHOD("get_time_left"), &SceneTreeTimer::get_time_left);
+@@ -140,7 +441,165 @@ void SceneTree::ClientPhysicsInterpolation::physics_process() {
+ bool SceneTree::_physics_interpolation_enabled = false;
+ bool SceneTree::_physics_interpolation_enabled_in_project = false;
+ 
++#ifdef DEBUG_ENABLED
++
++namespace QuarryDelete {
++
++thread_local Root *current = nullptr;
++
++void Root::account(uint64_t p_now) {
++	if (p_now >= last) {
++		elapsed[active] += p_now - last;
++		last = p_now;
++	}
++}
++
++void Scope::transition(Site p_site, bool p_count) {
++	root->account(OS::get_singleton()->get_ticks_usec());
++	root->active = p_site;
++	root->visits[p_site] += p_count;
++}
++
++} // namespace QuarryDelete
++
++namespace {
++
++enum QuarryDeleteBranch { QDELETE_INACTIVE = -1, QDELETE_PHYSICS, QDELETE_IDLE, QDELETE_BRANCH_COUNT };
++thread_local QuarryDeleteBranch quarry_delete_branch = QDELETE_INACTIVE;
++thread_local bool quarry_delete_capturing = false;
++
++bool quarry_delete_requested() {
++	static const bool requested = OS::get_singleton()->get_environment("QUARRY_SCENE_DELETE_PROFILE") == "1";
++	return requested && EngineDebugger::is_active() && EngineDebugger::is_profiling(SNAME("servers"));
++}
++
++bool quarry_delete_sites_requested() {
++	static const bool requested = OS::get_singleton()->get_environment("QUARRY_SCENE_DELETE_PHASES") == "1";
++	return requested;
++}
++
++struct QuarryDeleteCall {
++	const QuarryDeleteBranch previous = quarry_delete_branch;
++	QuarryDeleteCall(QuarryDeleteBranch p_branch) {
++		quarry_delete_branch = quarry_delete_requested() ? p_branch : QDELETE_INACTIVE;
++	}
++	~QuarryDeleteCall() { quarry_delete_branch = previous; }
++};
++
++struct QuarryDeleteFlush {
++	const bool previous = quarry_delete_capturing;
++	const bool active = !previous && quarry_delete_branch != QDELETE_INACTIVE;
++	const uint64_t start = active ? OS::get_singleton()->get_ticks_usec() : 0;
++	QuarryDeleteFlush() { quarry_delete_capturing |= active; }
++	~QuarryDeleteFlush() { quarry_delete_capturing = previous; }
++};
++
++struct QuarryDeleteBucket {
++	uint64_t elapsed = 0;
++	uint64_t count = 0;
++};
++
++struct QuarryDeleteBranchData {
++	uint64_t flushes = 0;
++	uint64_t flush_us = 0;
++	uint64_t stale = 0;
++	QuarryDeleteBucket roots;
++	HashMap<String, QuarryDeleteBucket> labels;
++	QuarryDeleteBucket overflow;
++	uint64_t site_us[QuarryDelete::SITE_COUNT]{};
++	uint64_t site_counts[QuarryDelete::SITE_COUNT]{};
++};
++
++QuarryDeleteBranchData quarry_delete_stats[QDELETE_BRANCH_COUNT];
++
++String quarry_delete_label(const Object *p_object) {
++	String label = p_object->get_class_name();
++	// Access the already installed script instance. Do not ask for properties,
++	// methods or other data that could dispatch back into user code mid-flush.
++	const ScriptInstance *instance = p_object->get_script_instance();
++	const Ref<Script> script = instance ? instance->get_script() : Ref<Script>();
++	if (script.is_valid() && !script->get_path().is_empty()) {
++		return label + "|" + script->get_path();
++	}
++	const Node *node = Object::cast_to<Node>(p_object);
++	if (node && !node->get_scene_file_path().is_empty()) {
++		return label + "|" + node->get_scene_file_path();
++	}
++	return label;
++}
++
++void quarry_delete_record(QuarryDeleteBranchData &r_stats, const String &p_label, const QuarryDelete::Root &p_sample, bool p_sites, uint64_t p_us) {
++	QuarryDeleteBucket *bucket = r_stats.labels.getptr(p_label);
++	if (!bucket) {
++		bucket = r_stats.labels.size() < 64 ? &r_stats.labels[p_label] : &r_stats.overflow;
++	}
++	++bucket->count;
++	bucket->elapsed += p_us;
++	++r_stats.roots.count;
++	r_stats.roots.elapsed += p_us;
++	if (p_sites) {
++		for (int i = 0; i < QuarryDelete::SITE_COUNT; ++i) {
++			r_stats.site_us[i] += p_sample.elapsed[i];
++			r_stats.site_counts[i] += p_sample.visits[i];
++		}
++	}
++}
++
++void quarry_publish_delete_profile() {
++	if (!quarry_delete_stats[QDELETE_PHYSICS].flushes && !quarry_delete_stats[QDELETE_IDLE].flushes) {
++		return;
++	}
++	Array times = { "scene_quarry_delete_times" };
++	Array counts = { "scene_quarry_delete_counts" };
++	for (int branch = 0; branch < QDELETE_BRANCH_COUNT; ++branch) {
++		QuarryDeleteBranchData &stats = quarry_delete_stats[branch];
++		if (!stats.flushes) {
++			continue;
++		}
++		const String prefix = branch == QDELETE_PHYSICS ? "physics:" : "idle:";
++		auto append = [&](const String &p_key, uint64_t p_time, uint64_t p_count) {
++			times.append(prefix + p_key);
++			times.append(p_time * 0.000001);
++			counts.append(prefix + p_key);
++			counts.append(double(p_count));
++		};
++		append("total:flush", stats.flush_us, stats.flushes);
++		append("total:memdelete", stats.roots.elapsed, stats.roots.count);
++		append("total:stale_id", 0, stats.stale);
++		for (const KeyValue<String, QuarryDeleteBucket> &entry : stats.labels) {
++			append("root:" + entry.key, entry.value.elapsed, entry.value.count);
++		}
++		if (stats.overflow.count) {
++			append("root:other_distinct", stats.overflow.elapsed, stats.overflow.count);
++		}
++		if (quarry_delete_sites_requested()) {
++			static const char *names[] = { "destructor_without_named_sites", "node_predelete_ownership", "remove_child_self", "exit_tree_self", "exit_script_and_signal", "exit_notification", "process_group_unregister", "scene_group_unregister", "node_removed", "tree_changed", "after_exit_tree", "child:other", "child:Sprite3D", "child:AnimatedSprite3D", "child:GPUParticles3D", "child:CPUParticles3D", "child:AnimationPlayer", "child:AnimationTree", "child:Timer", "child:CollisionShape3D", "child:Area3D", "child:MeshInstance3D", "child:OmniLight3D", "child:AudioStreamPlayer3D", "child:AudioStreamPlayer", "child:Node3D", "render_free_dispatch", "renderer_global_dirty_drain", "rd_remove_dependencies", "rd_schedule_resource_free", "object_predelete_other", "object_destructor_other" };
++			static_assert(sizeof(names) / sizeof(names[0]) == QuarryDelete::SITE_COUNT);
++			for (int i = 0; i < QuarryDelete::SITE_COUNT; ++i) {
++				append("site:" + String(names[i]), stats.site_us[i], stats.site_counts[i]);
++			}
++		}
++		stats = QuarryDeleteBranchData{};
++	}
++	if (times.size() > 1 && quarry_delete_requested()) {
++		EngineDebugger::profiler_add_frame_data(SNAME("servers"), times);
++		EngineDebugger::profiler_add_frame_data(SNAME("servers"), counts);
++	}
++}
++
++} // namespace
++
++#define QUARRY_DELETE_QUEUE_BEGIN(m_branch) { QuarryDeleteCall quarry_delete_call(m_branch);
++#define QUARRY_DELETE_QUEUE_END() }
++#define QUARRY_DELETE_PUBLISH() quarry_publish_delete_profile()
++#else
++#define QUARRY_DELETE_QUEUE_BEGIN(m_branch)
++#define QUARRY_DELETE_QUEUE_END()
++#define QUARRY_DELETE_PUBLISH() ((void)0)
++#endif
++
+ void SceneTree::tree_changed() {
++	QUARRY_DELETE_SCOPE(EXIT_TREE_CHANGED_SIGNAL);
+ 	emit_signal(tree_changed_name);
+ }
+ 
+@@ -149,6 +608,7 @@ void SceneTree::node_added(Node *p_node) {
+ }
+ 
+ void SceneTree::node_removed(Node *p_node) {
++	QUARRY_DELETE_SCOPE(EXIT_NODE_REMOVED_SIGNAL);
+ 	// Nodes can only be removed from the main thread.
+ 	if (current_scene == p_node) {
+ 		current_scene = nullptr;
+@@ -178,6 +638,7 @@ SceneTree::Group *SceneTree::add_to_group(const StringName &p_group, Node *p_nod
+ }
+ 
+ void SceneTree::remove_from_group(const StringName &p_group, Node *p_node) {
++	QUARRY_DELETE_SCOPE(SCENE_GROUP_UNREGISTER);
+ 	_THREAD_SAFE_METHOD_
+ 
+ 	HashMap<StringName, Group>::Iterator E = group_map.find(p_group);
+@@ -189,17 +650,278 @@ void SceneTree::remove_from_group(const StringName &p_group, Node *p_node) {
+ 	}
+ }
+ 
++#ifdef QUARRY_NATIVE_TRANSFORM_ATTRIBUTION
++thread_local bool quarry_transform_recursion_armed = false;
++
++namespace {
++
++enum class QuarryTransformMode {
++	OFF,
++	CLOCK,
++	SAMPLE,
++};
++
++enum QuarryTransformSite {
++	QUARRY_TRANSFORM_OTHER,
++	QUARRY_TRANSFORM_ITERATION_PREPARE,
++	QUARRY_TRANSFORM_PHYSICS_BEFORE_BASE,
++	QUARRY_TRANSFORM_PHYSICS_AFTER_TIMERS,
++	QUARRY_TRANSFORM_ITERATION_END,
++	QUARRY_TRANSFORM_IDLE_BEFORE_FTI,
++	QUARRY_TRANSFORM_IDLE_BEFORE_GROUPS,
++	QUARRY_TRANSFORM_IDLE_AFTER_GROUPS,
++	QUARRY_TRANSFORM_IDLE_AFTER_TIMERS,
++	QUARRY_TRANSFORM_SITE_COUNT,
++};
++
++constexpr const char *quarry_transform_site_names[] = {
++	"other", "iteration_prepare", "physics_before_base", "physics_after_timers", "iteration_end",
++	"idle_before_fti", "idle_before_groups", "idle_after_groups", "idle_after_timers",
++};
++static_assert(sizeof(quarry_transform_site_names) / sizeof(*quarry_transform_site_names) == QUARRY_TRANSFORM_SITE_COUNT);
++
++thread_local QuarryTransformMode quarry_transform_mode = QuarryTransformMode::OFF;
++thread_local QuarryTransformSite quarry_transform_site = QUARRY_TRANSFORM_OTHER;
++thread_local unsigned quarry_transform_depth = 0;
++uint64_t quarry_transform_open_us = 0;
++
++struct QuarryTransformKey {
++	StringName native_class;
++	StringName parent_class;
++	String own_script;
++	String parent_script;
++
++	bool operator==(const QuarryTransformKey &p_other) const {
++		return native_class == p_other.native_class && parent_class == p_other.parent_class &&
++				own_script == p_other.own_script && parent_script == p_other.parent_script;
++	}
++
++	static uint32_t hash(const QuarryTransformKey &p_key) {
++		uint32_t value = hash_murmur3_one_32(p_key.native_class.hash());
++		value = hash_murmur3_one_32(p_key.parent_class.hash(), value);
++		value = hash_murmur3_one_32(p_key.own_script.hash(), value);
++		return hash_murmur3_one_32(p_key.parent_script.hash(), value);
++	}
++};
++
++String quarry_transform_script_path(const Node *p_node) {
++	const Ref<Script> script = p_node->get_script();
++	if (script.is_null()) {
++		return String();
++	}
++	const String &path = script->get_path();
++	return path.is_empty() ? String("<embedded>") : path;
++}
++
++QuarryTransformKey quarry_transform_key(const Node *p_node) {
++	const Node *parent = p_node->get_parent();
++	QuarryTransformKey key{ p_node->get_class_name(), parent ? parent->get_class_name() : StringName(), quarry_transform_script_path(p_node), String() };
++	for (unsigned level = 0; parent && level < 8; ++level, parent = parent->get_parent()) {
++		key.parent_script = quarry_transform_script_path(parent);
++		if (!key.parent_script.is_empty()) {
++			break;
++		}
++	}
++	return key;
++}
++
++_FORCE_INLINE_ uint64_t quarry_transform_stamp() {
++	return Time::get_singleton()->get_ticks_usec();
++}
++
++struct QuarryTransformSamples {
++	uint64_t hits = 0;
++	uint64_t qpc_us = 0;
++};
++
++struct QuarryTransformBucket {
++	static constexpr uint32_t stride = 32;
++	uint64_t flushes = 0;
++	uint64_t nested_flushes = 0;
++	uint64_t visits = 0;
++	uint64_t inclusive_us = 0;
++	uint64_t sampled_us = 0;
++	uint64_t samples = 0;
++	HashMap<QuarryTransformKey, QuarryTransformSamples, QuarryTransformKey> labels;
++
++	_FORCE_INLINE_ bool visit() {
++		const uint32_t ordinal = uint32_t(visits++);
++		// Move the selected offset each block without touching gameplay RNG.
++		const uint32_t block = ordinal / stride;
++		const uint32_t mixed = (block * 0x9E3779B9u) ^ (block >> 2);
++		return quarry_transform_mode == QuarryTransformMode::SAMPLE && ordinal % stride == (mixed >> 27);
++	}
++
++	void record(const QuarryTransformKey &p_label, uint64_t p_us) {
++		QuarryTransformSamples &label = labels[p_label];
++		++label.hits;
++		label.qpc_us += p_us;
++		++samples;
++		sampled_us += p_us;
++	}
++
++	Dictionary receipt(const char *p_site, bool p_root) const {
++		Array rows;
++		for (const KeyValue<QuarryTransformKey, QuarryTransformSamples> &entry : labels) {
++			Dictionary row;
++			row["native_class"] = String(entry.key.native_class);
++			row["parent_class"] = String(entry.key.parent_class);
++			row["own_script"] = entry.key.own_script;
++			row["parent_script"] = entry.key.parent_script;
++			row["n"] = entry.value.hits;
++			row["qpc_us"] = entry.value.qpc_us;
++			rows.push_back(row);
++		}
++		Dictionary result;
++		result["site"] = p_site;
++		result[p_root ? "roots" : "receivers"] = visits;
++		if (!p_root) {
++			result["flushes"] = flushes;
++			result["nested_flushes"] = nested_flushes;
++			result["inclusive_qpc_us"] = inclusive_us;
++		}
++		result["sample_count"] = samples;
++		result["sample_qpc_us"] = sampled_us;
++		result["labels"] = rows;
++		return result;
++	}
++};
++
++QuarryTransformBucket quarry_transform_flush[QUARRY_TRANSFORM_SITE_COUNT];
++QuarryTransformBucket quarry_transform_roots[2];
++
++QuarryTransformBucket &quarry_transform_root_bin() {
++	return quarry_transform_roots[Engine::get_singleton()->is_in_physics_frame() ? 1 : 0];
++}
++
++bool quarry_transform_window(bool p_active) {
++	if (!Thread::is_main_thread() || quarry_transform_depth != 0) {
++		return false;
++	}
++	if (p_active) {
++		if (quarry_transform_mode != QuarryTransformMode::OFF) {
++			return false;
++		}
++		OS *os = OS::get_singleton();
++		const String mode = os->get_environment("QUARRY_TRANSFORM_ATTRIBUTION");
++		if ((mode != "clock" && mode != "sample") ||
++				os->get_environment("QUARRY_TEST_PROFILE") != "1" ||
++				os->get_environment("QUARRY_PROBE_NO_SAVE") != "1" ||
++				os->get_environment("QUARRY_PROBE_QUIT_AFTER_ACTIVE") != "1" ||
++				!os->get_environment("APPDATA").replace("\\", "/").contains("/rollover-probe/mailbox-") ||
++				!os->get_environment("QUARRY_CONTROL_DIR").replace("\\", "/").contains("/rollover-probe/mailbox-")) {
++			return false;
++		}
++		for (QuarryTransformBucket &bucket : quarry_transform_flush) {
++			bucket = QuarryTransformBucket();
++		}
++		for (QuarryTransformBucket &bucket : quarry_transform_roots) {
++			bucket = QuarryTransformBucket();
++		}
++		quarry_transform_recursion_armed = os->get_environment("QUARRY_TRANSFORM_RECURSION") == "1";
++		quarry_transform_open_us = quarry_transform_stamp();
++		quarry_transform_mode = mode == "sample" ? QuarryTransformMode::SAMPLE : QuarryTransformMode::CLOCK;
++		return true;
++	}
++	if (quarry_transform_mode == QuarryTransformMode::OFF) {
++		return false;
++	}
++	const bool roots = quarry_transform_recursion_armed;
++	const bool sample = quarry_transform_mode == QuarryTransformMode::SAMPLE;
++	quarry_transform_mode = QuarryTransformMode::OFF;
++	quarry_transform_recursion_armed = false;
++	quarry_transform_site = QUARRY_TRANSFORM_OTHER;
++	const uint64_t close_us = quarry_transform_stamp();
++	Array flush_rows;
++	Array root_rows;
++	for (int i = 0; i < QUARRY_TRANSFORM_SITE_COUNT; ++i) {
++		flush_rows.push_back(quarry_transform_flush[i].receipt(quarry_transform_site_names[i], false));
++		quarry_transform_flush[i].labels.clear();
++	}
++	if (roots) {
++		root_rows.push_back(quarry_transform_roots[0].receipt("root_outside_physics", true));
++		root_rows.push_back(quarry_transform_roots[1].receipt("root_physics", true));
++		quarry_transform_roots[0].labels.clear();
++		quarry_transform_roots[1].labels.clear();
++	}
++	Dictionary result;
++	result["mode"] = sample ? "sample" : "clock";
++	result["stride"] = QuarryTransformBucket::stride;
++	result["roots_enabled"] = roots;
++	result["begin_qpc_us"] = quarry_transform_open_us;
++	result["end_qpc_us"] = close_us;
++	result["flush"] = flush_rows;
++	result["recursion"] = root_rows;
++	print_line("QUARRY_NATIVE_TRANSFORM_ATTRIBUTION " + JSON::stringify(result));
++	return true;
++}
++
++} // namespace
++
++#ifndef _3D_DISABLED
++uint64_t quarry_transform_root_enter() {
++	return quarry_transform_root_bin().visit() ? quarry_transform_stamp() : 0;
++}
++
++void quarry_transform_root_leave(Node3D *p_node, uint64_t p_start) {
++	const uint64_t elapsed = quarry_transform_stamp() - p_start;
++	quarry_transform_root_bin().record(quarry_transform_key(p_node), elapsed);
++}
++#endif
++
++#define QUARRY_TRANSFORM_FLUSH(m_site) \
++	do { \
++		if (unlikely(quarry_transform_mode != QuarryTransformMode::OFF)) { \
++			quarry_transform_site = QUARRY_TRANSFORM_##m_site; \
++		} \
++		flush_transform_notifications(); \
++	} while (false)
++#else
++#define QUARRY_TRANSFORM_FLUSH(m_site) flush_transform_notifications()
++#endif
++
+ void SceneTree::flush_transform_notifications() {
+ 	_THREAD_SAFE_METHOD_
+ 
++#ifdef QUARRY_NATIVE_TRANSFORM_ATTRIBUTION
++	// Compile an ordinary drain and a separate instrumented one from the same traversal.
++	const auto drain = [&](auto p_bucket) {
++#endif
+ 	SelfList<Node> *n = xform_change_list.first();
+ 	while (n) {
+ 		Node *node = n->self();
+ 		SelfList<Node> *nx = n->next();
+ 		xform_change_list.remove(n);
+ 		n = nx;
++#ifdef QUARRY_NATIVE_TRANSFORM_ATTRIBUTION
++		if constexpr (!std::is_same_v<decltype(p_bucket), decltype(nullptr)>) {
++			if (p_bucket->visit()) {
++				const QuarryTransformKey label = quarry_transform_key(node);
++				const uint64_t begin = quarry_transform_stamp();
++				node->notification(NOTIFICATION_TRANSFORM_CHANGED);
++				p_bucket->record(label, quarry_transform_stamp() - begin);
++				continue;
++			}
++		}
++#endif
+ 		node->notification(NOTIFICATION_TRANSFORM_CHANGED);
+ 	}
++#ifdef QUARRY_NATIVE_TRANSFORM_ATTRIBUTION
++	};
++	if (likely(quarry_transform_mode == QuarryTransformMode::OFF)) {
++		drain(nullptr);
++		return;
++	}
++	QuarryTransformBucket &bucket = quarry_transform_flush[quarry_transform_site];
++	quarry_transform_site = QUARRY_TRANSFORM_OTHER;
++	++bucket.flushes;
++	bucket.nested_flushes += quarry_transform_depth > 0;
++	++quarry_transform_depth;
++	const uint64_t begin = quarry_transform_stamp();
++	drain(&bucket);
++	bucket.inclusive_us += quarry_transform_stamp() - begin;
++	--quarry_transform_depth;
++#endif
+ }
+ 
+ bool SceneTree::is_accessibility_enabled() const {
+@@ -590,6 +1312,11 @@ void SceneTree::set_physics_interpolation_enabled(bool p_enabled) {
+ 		return;
+ 	}
+ 
++#ifndef _3D_DISABLED
++	if (!quarry_render_transforms.is_empty()) {
++		_quarry_flush_render_transforms();
++	}
++#endif
+ 	_physics_interpolation_enabled = p_enabled;
+ 	RenderingServer::get_singleton()->set_physics_interpolation_enabled(p_enabled);
+ 
+@@ -617,43 +1344,257 @@ void SceneTree::iteration_prepare() {
+ 	if (_physics_interpolation_enabled) {
+ 		// Make sure any pending transforms from the last tick / frame
+ 		// are flushed before pumping the interpolation prev and currents.
+-		flush_transform_notifications();
++		QUARRY_TRANSFORM_FLUSH(ITERATION_PREPARE);
+ 		get_scene_tree_fti().tick_update();
+ 		RenderingServer::get_singleton()->tick();
+ 	}
+ }
+ 
++
++#ifdef DEBUG_ENABLED
++namespace {
++
++// Called only on the main thread. Physics calls accumulate until one idle pass.
++struct QuarrySceneBodyProbe {
++	enum Phase {
++		PHYSICS_ENTRY,
++		PHYSICS_TRANSFORM_BEFORE_BASE,
++		PHYSICS_BASE,
++		PHYSICS_FRAME_SIGNAL,
++		PHYSICS_PICKING,
++		PHYSICS_GROUPS,
++		PHYSICS_UNIQUE_GROUP_CALLS,
++		PHYSICS_MESSAGE_QUEUE,
++		PHYSICS_TIMERS,
++		PHYSICS_TWEENS,
++		PHYSICS_TRANSFORM_AFTER_TIMERS,
++		PHYSICS_DELETE_QUEUE,
++		PHYSICS_IDLE_CALLBACKS,
++		IDLE_TRANSFORM_BEFORE_FTI,
++		IDLE_FTI_FIRST,
++		IDLE_BASE,
++		IDLE_MULTIPLAYER,
++		IDLE_FRAME_SIGNAL,
++		IDLE_MESSAGE_QUEUE_BEFORE_GROUPS,
++		IDLE_TRANSFORM_BEFORE_GROUPS,
++		IDLE_GROUPS,
++		IDLE_ORDER_PROFILER_PUBLISH,
++		IDLE_UNIQUE_GROUP_CALLS,
++		IDLE_MESSAGE_QUEUE_AFTER_GROUPS,
++		IDLE_TRANSFORM_AFTER_GROUPS,
++		IDLE_SCENE_CHANGE,
++		IDLE_TIMERS,
++		IDLE_TWEENS,
++		IDLE_TRANSFORM_AFTER_TIMERS,
++		IDLE_DELETE_QUEUE,
++		IDLE_ACCESSIBILITY,
++		IDLE_IDLE_CALLBACKS,
++		IDLE_EDITOR_DEFAULTS,
++		IDLE_FTI_SECOND,
++		IDLE_RENDER_PREDRAW,
++		PHASE_COUNT,
++	};
++
++	static bool enabled() {
++		static const bool requested = OS::get_singleton()->get_environment("QUARRY_SCENE_BODY_PROFILE") == "1";
++		return requested && EngineDebugger::is_active() && EngineDebugger::is_profiling(SNAME("servers"));
++	}
++
++	uint64_t elapsed[PHASE_COUNT]{};
++	uint64_t accounted[2]{};
++	uint32_t calls[2]{};
++
++	void publish() {
++		if (!calls[0] && !calls[1]) {
++			return;
++		}
++		if (enabled()) {
++			static const char *names[] = {
++				"physics_entry",
++				"physics_transform_before_base",
++				"physics_base",
++				"physics_frame_signal",
++				"physics_picking",
++				"physics_groups",
++				"physics_unique_group_calls",
++				"physics_message_queue",
++				"physics_timers",
++				"physics_tweens",
++				"physics_transform_after_timers",
++				"physics_delete_queue",
++				"physics_idle_callbacks",
++				"idle_transform_before_fti",
++				"idle_fti_first",
++				"idle_base",
++				"idle_multiplayer",
++				"idle_frame_signal",
++				"idle_message_queue_before_groups",
++				"idle_transform_before_groups",
++				"idle_groups",
++				"idle_order_profiler_publish",
++				"idle_unique_group_calls",
++				"idle_message_queue_after_groups",
++				"idle_transform_after_groups",
++				"idle_scene_change",
++				"idle_timers",
++				"idle_tweens",
++				"idle_transform_after_timers",
++				"idle_delete_queue",
++				"idle_accessibility",
++				"idle_idle_callbacks",
++				"idle_editor_defaults",
++				"idle_fti_second",
++				"idle_render_predraw",
++			};
++			static_assert(sizeof(names) / sizeof(names[0]) == PHASE_COUNT);
++			Array times;
++			Array counts;
++			times.append("scene_quarry_body_times");
++			counts.append("scene_quarry_body_counts");
++			for (int i = 0; i < PHASE_COUNT; ++i) {
++				times.append(names[i]);
++				times.append(elapsed[i] * 0.000001);
++			}
++			times.append("physics_accounted");
++			times.append(accounted[0] * 0.000001);
++			times.append("idle_accounted");
++			times.append(accounted[1] * 0.000001);
++			counts.append("physics_calls");
++			counts.append(double(calls[0]));
++			counts.append("idle_calls");
++			counts.append(double(calls[1]));
++			EngineDebugger::profiler_add_frame_data(SNAME("servers"), times);
++			EngineDebugger::profiler_add_frame_data(SNAME("servers"), counts);
++		}
++		for (uint64_t &phase : elapsed) {
++			phase = 0;
++		}
++		accounted[0] = accounted[1] = 0;
++		calls[0] = calls[1] = 0;
++	}
++};
++
++QuarrySceneBodyProbe quarry_scene_body;
++
++class QuarrySceneBodySample {
++	const bool valid = QuarrySceneBodyProbe::enabled();
++	const uint64_t start = valid ? OS::get_singleton()->get_ticks_usec() : 0;
++	uint64_t last = start;
++	uint64_t elapsed[QuarrySceneBodyProbe::PHASE_COUNT];
++
++public:
++	QuarrySceneBodySample() {
++		if (valid) {
++			for (uint64_t &phase : elapsed) {
++				phase = 0;
++			}
++		}
++	}
++
++	void mark(QuarrySceneBodyProbe::Phase p_phase) {
++		if (!valid) {
++			return;
++		}
++		const uint64_t now = OS::get_singleton()->get_ticks_usec();
++		if (now >= last) {
++			elapsed[p_phase] += now - last;
++			last = now;
++		}
++	}
++
++	void finish(bool p_physics) const {
++		if (valid) {
++			const int branch = p_physics ? 0 : 1;
++			const int start_index = p_physics ? QuarrySceneBodyProbe::PHYSICS_ENTRY : QuarrySceneBodyProbe::IDLE_TRANSFORM_BEFORE_FTI;
++			const int end_index = p_physics ? QuarrySceneBodyProbe::IDLE_TRANSFORM_BEFORE_FTI : QuarrySceneBodyProbe::PHASE_COUNT;
++			for (int i = start_index; i < end_index; ++i) {
++				quarry_scene_body.elapsed[i] += elapsed[i];
++			}
++			quarry_scene_body.accounted[branch] += last - start;
++			++quarry_scene_body.calls[branch];
++		}
++		if (!p_physics) {
++			quarry_scene_body.publish();
++		}
++	}
++};
++
++} // namespace
++
++#define QUARRY_SCENE_BODY_START() QuarrySceneBodySample quarry_body
++#define QUARRY_SCENE_BODY_MARK(m_phase) quarry_body.mark(QuarrySceneBodyProbe::m_phase)
++#define QUARRY_SCENE_BODY_FINISH(m_physics) quarry_body.finish(m_physics)
++#else
++#define QUARRY_SCENE_BODY_START() ((void)0)
++#define QUARRY_SCENE_BODY_MARK(m_phase) ((void)0)
++#define QUARRY_SCENE_BODY_FINISH(m_physics) ((void)0)
++#endif // DEBUG_ENABLED
++
++#ifdef DEBUG_ENABLED
++void quarry_profiled_scene_physics_queue_flush(CallQueue *p_queue);
++void quarry_publish_scene_physics_queue_profile();
++#endif
++
+ bool SceneTree::physics_process(double p_time) {
++	QUARRY_SCENE_BODY_START();
+ 	current_frame++;
++	QUARRY_SCENE_BODY_MARK(PHYSICS_ENTRY);
+ 
+-	flush_transform_notifications();
++	QUARRY_TRANSFORM_FLUSH(PHYSICS_BEFORE_BASE);
++	QUARRY_SCENE_BODY_MARK(PHYSICS_TRANSFORM_BEFORE_BASE);
+ 
+ 	if (MainLoop::physics_process(p_time)) {
+ 		_quit = true;
+ 	}
+ 	physics_process_time = p_time;
++	QUARRY_SCENE_BODY_MARK(PHYSICS_BASE);
+ 
++#ifdef DEBUG_ENABLED
++	quarry_profile_scene_frame_signal(this, SNAME("physics_frame"), true);
++#else
+ 	emit_signal(SNAME("physics_frame"));
++#endif
++	QUARRY_SCENE_BODY_MARK(PHYSICS_FRAME_SIGNAL);
+ 
+ #if !defined(PHYSICS_2D_DISABLED) || !defined(PHYSICS_3D_DISABLED)
+ 	call_group(SNAME("_picking_viewports"), SNAME("_process_picking"));
+ #endif // !defined(PHYSICS_2D_DISABLED) || !defined(PHYSICS_3D_DISABLED)
++	QUARRY_SCENE_BODY_MARK(PHYSICS_PICKING);
+ 
++#ifdef DEBUG_ENABLED
++	quarry_scene_order.arm();
++	quarry_physics_notifications.arm_on_physics();
++#endif
+ 	_process(true);
++	QUARRY_SCENE_BODY_MARK(PHYSICS_GROUPS);
+ 
+ 	_flush_ugc();
++	QUARRY_SCENE_BODY_MARK(PHYSICS_UNIQUE_GROUP_CALLS);
++#ifdef DEBUG_ENABLED
++	quarry_profiled_scene_physics_queue_flush(MessageQueue::get_singleton());
++#else
+ 	MessageQueue::get_singleton()->flush(); //small little hack
++#endif
++	QUARRY_SCENE_BODY_MARK(PHYSICS_MESSAGE_QUEUE);
+ 
+ 	process_timers(p_time, true); //go through timers
++	QUARRY_SCENE_BODY_MARK(PHYSICS_TIMERS);
+ 	process_tweens(p_time, true);
++	QUARRY_SCENE_BODY_MARK(PHYSICS_TWEENS);
+ 
+-	flush_transform_notifications();
++	QUARRY_TRANSFORM_FLUSH(PHYSICS_AFTER_TIMERS);
++	QUARRY_SCENE_BODY_MARK(PHYSICS_TRANSFORM_AFTER_TIMERS);
+ 
+ 	// This should happen last because any processing that deletes something beforehand might expect the object to be removed in the same frame.
++	QUARRY_DELETE_QUEUE_BEGIN(QDELETE_PHYSICS);
+ 	_flush_delete_queue();
++	QUARRY_DELETE_QUEUE_END();
++	QUARRY_SCENE_BODY_MARK(PHYSICS_DELETE_QUEUE);
+ 
+ 	_call_idle_callbacks();
++	QUARRY_SCENE_BODY_MARK(PHYSICS_IDLE_CALLBACKS);
+ 
++	QUARRY_SCENE_BODY_FINISH(true);
+ 	return _quit;
+ }
+ 
+@@ -661,7 +1602,7 @@ void SceneTree::iteration_end() {
+ 	// When physics interpolation is active, we want all pending transforms
+ 	// to be flushed to the RenderingServer before finishing a physics tick.
+ 	if (_physics_interpolation_enabled) {
+-		flush_transform_notifications();
++		QUARRY_TRANSFORM_FLUSH(ITERATION_END);
+ 
+ #ifndef _3D_DISABLED
+ 		// Any objects performing client physics interpolation
+@@ -672,7 +1613,20 @@ void SceneTree::iteration_end() {
+ 	}
+ }
+ 
++#ifndef _3D_DISABLED
++void SceneTree::_quarry_flush_render_transforms() {
++	for (ObjectID id : quarry_render_transforms) {
++		VisualInstance3D *visual = Object::cast_to<VisualInstance3D>(ObjectDB::get_instance(id));
++		if (visual && visual->is_inside_tree() && visual->get_tree() == this) {
++			visual->_quarry_flush_render_transform(this);
++		}
++	}
++	quarry_render_transforms.clear();
++}
++#endif
++
+ bool SceneTree::process(double p_time) {
++	QUARRY_SCENE_BODY_START();
+ 	// First pass of scene tree fixed timestep interpolation.
+ 	if (get_scene_tree_fti().is_enabled()) {
+ 		// Special, we need to ensure RenderingServer is up to date
+@@ -680,15 +1634,18 @@ bool SceneTree::process(double p_time) {
+ 		// the FTI update.
+ 		// If this is not done, we can end up with a deferred `set_transform()`
+ 		// overwriting the interpolated xform in the server.
+-		flush_transform_notifications();
++		QUARRY_TRANSFORM_FLUSH(IDLE_BEFORE_FTI);
++		QUARRY_SCENE_BODY_MARK(IDLE_TRANSFORM_BEFORE_FTI);
+ 		get_scene_tree_fti().frame_update(get_root(), true);
+ 	}
+ 
++	QUARRY_SCENE_BODY_MARK(IDLE_FTI_FIRST);
+ 	if (MainLoop::process(p_time)) {
+ 		_quit = true;
+ 	}
+ 
+ 	process_time = p_time;
++	QUARRY_SCENE_BODY_MARK(IDLE_BASE);
+ 
+ 	if (multiplayer_poll) {
+ 		multiplayer->poll();
+@@ -697,33 +1654,69 @@ bool SceneTree::process(double p_time) {
+ 		}
+ 	}
+ 
++#ifndef _3D_DISABLED
++	// _in_physics is false here. Later idle transform changes and notification
++	// drains still use the normal direct path before this frame can draw.
++	if (!quarry_render_transforms.is_empty()) {
++		_quarry_flush_render_transforms();
++	}
++#endif
++	QUARRY_SCENE_BODY_MARK(IDLE_MULTIPLAYER);
++#ifdef DEBUG_ENABLED
++	quarry_profile_scene_frame_signal(this, SNAME("process_frame"), false);
++#else
+ 	emit_signal(SNAME("process_frame"));
++#endif
++	QUARRY_SCENE_BODY_MARK(IDLE_FRAME_SIGNAL);
+ 
+ 	MessageQueue::get_singleton()->flush(); //small little hack
++	QUARRY_SCENE_BODY_MARK(IDLE_MESSAGE_QUEUE_BEFORE_GROUPS);
+ 
+-	flush_transform_notifications();
++	QUARRY_TRANSFORM_FLUSH(IDLE_BEFORE_GROUPS);
++	QUARRY_SCENE_BODY_MARK(IDLE_TRANSFORM_BEFORE_GROUPS);
+ 
++#ifdef DEBUG_ENABLED
++	quarry_scene_order.arm();
++#endif
+ 	_process(false);
++	QUARRY_SCENE_BODY_MARK(IDLE_GROUPS);
++#ifdef DEBUG_ENABLED
++	quarry_scene_order.flush_on_idle();
++	quarry_physics_notifications.flush_on_idle();
++#endif
++	QUARRY_SCENE_BODY_MARK(IDLE_ORDER_PROFILER_PUBLISH);
+ 
+ 	_flush_ugc();
++	QUARRY_SCENE_BODY_MARK(IDLE_UNIQUE_GROUP_CALLS);
+ 	MessageQueue::get_singleton()->flush(); //small little hack
+-	flush_transform_notifications(); //transforms after world update, to avoid unnecessary enter/exit notifications
++	QUARRY_SCENE_BODY_MARK(IDLE_MESSAGE_QUEUE_AFTER_GROUPS);
++	QUARRY_TRANSFORM_FLUSH(IDLE_AFTER_GROUPS); //transforms after world update, to avoid unnecessary enter/exit notifications
++	QUARRY_SCENE_BODY_MARK(IDLE_TRANSFORM_AFTER_GROUPS);
+ 
+ 	if (unlikely(pending_new_scene_id.is_valid())) {
+ 		_flush_scene_change();
+ 	}
+ 
++	QUARRY_SCENE_BODY_MARK(IDLE_SCENE_CHANGE);
+ 	process_timers(p_time, false); //go through timers
++	QUARRY_SCENE_BODY_MARK(IDLE_TIMERS);
+ 	process_tweens(p_time, false);
++	QUARRY_SCENE_BODY_MARK(IDLE_TWEENS);
+ 
+-	flush_transform_notifications(); // Additional transforms after timers update.
++	QUARRY_TRANSFORM_FLUSH(IDLE_AFTER_TIMERS); // Additional transforms after timers update.
++	QUARRY_SCENE_BODY_MARK(IDLE_TRANSFORM_AFTER_TIMERS);
+ 
+ 	// This should happen last because any processing that deletes something beforehand might expect the object to be removed in the same frame.
++	QUARRY_DELETE_QUEUE_BEGIN(QDELETE_IDLE);
+ 	_flush_delete_queue();
++	QUARRY_DELETE_QUEUE_END();
++	QUARRY_SCENE_BODY_MARK(IDLE_DELETE_QUEUE);
+ 
+ 	_flush_accessibility_changes();
++	QUARRY_SCENE_BODY_MARK(IDLE_ACCESSIBILITY);
+ 
+ 	_call_idle_callbacks();
++	QUARRY_SCENE_BODY_MARK(IDLE_IDLE_CALLBACKS);
+ 
+ #ifdef TOOLS_ENABLED
+ #ifndef _3D_DISABLED
+@@ -765,18 +1758,33 @@ bool SceneTree::process(double p_time) {
+ #endif // _3D_DISABLED
+ #endif // TOOLS_ENABLED
+ 
++	QUARRY_SCENE_BODY_MARK(IDLE_EDITOR_DEFAULTS);
+ 	// Second pass of scene tree fixed timestep interpolation.
+ 	// ToDo: Possibly needs another flush_transform_notifications here
+ 	// depending on whether there are side effects to _call_idle_callbacks().
+ 	get_scene_tree_fti().frame_update(get_root(), false);
++	QUARRY_SCENE_BODY_MARK(IDLE_FTI_SECOND);
+ 
+ 	if (_physics_interpolation_enabled) {
+ 		RenderingServer::get_singleton()->pre_draw(true);
+ 	}
+ 
++	QUARRY_SCENE_BODY_MARK(IDLE_RENDER_PREDRAW);
++	QUARRY_SCENE_BODY_FINISH(false);
++#ifdef DEBUG_ENABLED
++	quarry_publish_scene_frame_signals();
++#endif
++	QUARRY_DELETE_PUBLISH();
++#ifdef DEBUG_ENABLED
++	quarry_publish_scene_physics_queue_profile();
++#endif
+ 	return _quit;
+ }
+ 
++#undef QUARRY_SCENE_BODY_START
++#undef QUARRY_SCENE_BODY_MARK
++#undef QUARRY_SCENE_BODY_FINISH
++
+ void SceneTree::process_timers(double p_delta, bool p_physics_frame) {
+ 	_THREAD_SAFE_METHOD_
+ 	const List<Ref<SceneTreeTimer>>::Element *L = timers.back(); // Last element.
+@@ -799,7 +1807,11 @@ void SceneTree::process_timers(double p_delta, bool p_physics_frame) {
+ 		timer->set_time_left(time_left);
+ 
+ 		if (time_left <= 0) {
++#ifdef DEBUG_ENABLED
++			quarry_profile_scene_frame_signal(timer.ptr(), SNAME("timeout"), p_physics_frame, true);
++#else
+ 			E->get()->emit_signal(SNAME("timeout"));
++#endif
+ 			timers.erase(E);
+ 		}
+ 		if (E == L) {
+@@ -1146,6 +2158,96 @@ bool SceneTree::is_suspended() const {
+ 	return suspended;
+ }
+ 
++#if 1 // Quarry release parity
++namespace {
++struct QuarryProcessPrefix {
++	struct Side {
++		int count = 0;
++		uint64_t epoch = 0;
++	};
++	Side idle;
++	Side physics;
++	std::atomic<uint64_t> reorder_epoch{ 0 };
++	bool activation_reported = false;
++
++	void reset() {
++		idle = Side();
++		physics = Side();
++		reorder_epoch.store(0, std::memory_order_relaxed);
++		activation_reported = false;
++	}
++};
++
++QuarryProcessPrefix quarry_process_prefix;
++
++bool quarry_process_prefix_enabled() {
++	static const bool enabled = OS::get_singleton()->get_environment("QUARRY_PROCESS_PREFIX_SORT") == "1";
++	return enabled;
++}
++
++// `nodes` only receives tail appends, stable erases and stock sorts. For a
++// small changed suffix, keep the existing sorted prefix and binary-insert
++// each new member using the exact stock comparator and stable pointer moves.
++template <typename Comparator>
++void quarry_insert_process_suffix(Node **p_nodes, int p_total, int p_prefix, Comparator p_less) {
++	for (int index = p_prefix; index < p_total; ++index) {
++		Node *node = p_nodes[index];
++		if (!p_less(node, p_nodes[index - 1])) {
++			continue;
++		}
++		int lo = 0;
++		int hi = index - 1;
++		while (lo < hi) {
++			const int middle = lo + (hi - lo) / 2;
++			if (p_less(node, p_nodes[middle])) {
++				hi = middle;
++			} else {
++				lo = middle + 1;
++			}
++		}
++		std::memmove(p_nodes + lo + 1, p_nodes + lo, size_t(index - lo) * sizeof(Node *));
++		p_nodes[lo] = node;
++	}
++}
++
++template <typename Comparator>
++void quarry_sort_process_prefix(Vector<Node *> &r_nodes, QuarryProcessPrefix::Side &r_side) {
++	const uint64_t epoch = quarry_process_prefix.reorder_epoch.load(std::memory_order_relaxed);
++	const int count = r_nodes.size();
++	const int appended = count - r_side.count;
++	if (r_side.epoch != epoch || r_side.count <= 0 || appended < 0 || appended > 16 || appended > count / 8) {
++		r_nodes.sort_custom<Comparator>();
++	} else if (appended > 0) {
++		quarry_insert_process_suffix(r_nodes.ptrw(), count, r_side.count, Comparator());
++		if (!quarry_process_prefix.activation_reported) {
++			quarry_process_prefix.activation_reported = true;
++			print_line("QUARRY_PROCESS_PREFIX_ACTIVE");
++		}
++	}
++	r_side.count = count;
++	r_side.epoch = epoch;
++}
++
++bool quarry_erase_process_prefix(Vector<Node *> &r_nodes, Node *p_node, QuarryProcessPrefix::Side &r_side) {
++	const int erased = r_nodes.find(p_node);
++	if (erased < 0) {
++		return false;
++	}
++	if (erased < r_side.count) {
++		--r_side.count;
++	}
++	r_nodes.remove_at(erased);
++	return true;
++}
++} // namespace
++
++void quarry_mark_process_child_order_changed(SceneTree *p_tree) {
++	if (quarry_process_prefix_enabled() && p_tree == SceneTree::get_singleton()) {
++		quarry_process_prefix.reorder_epoch.fetch_add(1, std::memory_order_relaxed);
++	}
++}
++#endif // DEBUG_ENABLED
++
+ void SceneTree::_process_group(ProcessGroup *p_group, bool p_physics) {
+ 	// When reading this function, keep in mind that this code must work in a way where
+ 	// if any node is removed, this needs to continue working.
+@@ -1157,24 +2259,52 @@ void SceneTree::_process_group(ProcessGroup *p_group, bool p_physics) {
+ 		return;
+ 	}
+ 
++#ifdef DEBUG_ENABLED
++	const bool quarry_gather = quarry_scene_order.armed.load(std::memory_order_relaxed);
++	const bool quarry_dirty = p_physics ? p_group->physics_node_order_dirty : p_group->node_order_dirty;
++	const uint64_t quarry_sort_begin = quarry_gather && quarry_dirty ? OS::get_singleton()->get_ticks_usec() : 0;
++#endif
++
+ 	if (p_physics) {
+ 		if (p_group->physics_node_order_dirty) {
+-			nodes.sort_custom<Node::ComparatorWithPhysicsPriority>();
++#if 1 // Quarry release parity
++			if (p_group == &default_process_group && this == singleton && quarry_process_prefix_enabled()) {
++				quarry_sort_process_prefix<Node::ComparatorWithPhysicsPriority>(nodes, quarry_process_prefix.physics);
++			} else
++#endif
++			{
++				nodes.sort_custom<Node::ComparatorWithPhysicsPriority>();
++			}
+ 			p_group->physics_node_order_dirty = false;
+ 		}
+ 	} else {
+ 		if (p_group->node_order_dirty) {
+-			nodes.sort_custom<Node::ComparatorWithPriority>();
++#if 1 // Quarry release parity
++			if (p_group == &default_process_group && this == singleton && quarry_process_prefix_enabled()) {
++				quarry_sort_process_prefix<Node::ComparatorWithPriority>(nodes, quarry_process_prefix.idle);
++			} else
++#endif
++			{
++				nodes.sort_custom<Node::ComparatorWithPriority>();
++			}
+ 			p_group->node_order_dirty = false;
+ 		}
+ 	}
+ 
++#ifdef DEBUG_ENABLED
++	const uint64_t quarry_loop_begin = quarry_gather ? OS::get_singleton()->get_ticks_usec() : 0;
++#endif
++
+ 	// Make a copy, so if nodes are added/removed from process, this does not break
+ 	Vector<Node *> nodes_copy = nodes;
+ 
+ 	uint32_t node_count = nodes_copy.size();
+ 	Node **nodes_ptr = (Node **)nodes_copy.ptr(); // Force cast, pointer will not change.
+ 
++#ifdef DEBUG_ENABLED
++	const bool quarry_sample_notifications = p_physics && Thread::is_main_thread() && quarry_physics_notifications.armed;
++#endif
++
+ 	for (uint32_t i = 0; i < node_count; i++) {
+ 		Node *n = nodes_ptr[i];
+ 		if (nodes_removed_on_group_call.has(n)) {
+@@ -1189,10 +2319,24 @@ void SceneTree::_process_group(ProcessGroup *p_group, bool p_physics) {
+ 
+ 		if (p_physics) {
+ 			if (n->is_physics_processing_internal()) {
+-				n->notification(Node::NOTIFICATION_INTERNAL_PHYSICS_PROCESS);
++#ifdef DEBUG_ENABLED
++				if (quarry_sample_notifications && quarry_physics_notifications.internal.select()) {
++					quarry_physics_notifications.deliver_sample(n, Node::NOTIFICATION_INTERNAL_PHYSICS_PROCESS, quarry_physics_notifications.internal);
++				} else
++#endif
++				{
++					n->notification(Node::NOTIFICATION_INTERNAL_PHYSICS_PROCESS);
++				}
+ 			}
+ 			if (n->is_physics_processing()) {
+-				n->notification(Node::NOTIFICATION_PHYSICS_PROCESS);
++#ifdef DEBUG_ENABLED
++				if (quarry_sample_notifications && quarry_physics_notifications.ordinary.select()) {
++					quarry_physics_notifications.deliver_sample(n, Node::NOTIFICATION_PHYSICS_PROCESS, quarry_physics_notifications.ordinary);
++				} else
++#endif
++				{
++					n->notification(Node::NOTIFICATION_PHYSICS_PROCESS);
++				}
+ 			}
+ 		} else {
+ 			if (n->is_processing_internal()) {
+@@ -1204,6 +2348,13 @@ void SceneTree::_process_group(ProcessGroup *p_group, bool p_physics) {
+ 		}
+ 	}
+ 
++#ifdef DEBUG_ENABLED
++	if (quarry_gather) {
++		quarry_scene_order.record(p_physics, quarry_dirty, node_count, quarry_dirty ? quarry_loop_begin - quarry_sort_begin : 0,
++				OS::get_singleton()->get_ticks_usec() - quarry_loop_begin);
++	}
++#endif
++
+ 	p_group->call_queue.flush(); // Flush messages also after processing (for potential deferred calls).
+ }
+ 
+@@ -1370,9 +2521,22 @@ void SceneTree::_add_process_group(Node *p_node) {
+ }
+ 
+ void SceneTree::_remove_node_from_process_group(Node *p_node, Node *p_owner) {
++	QUARRY_DELETE_SCOPE(PROCESS_GROUP_UNREGISTER);
+ 	_THREAD_SAFE_METHOD_
+ 	ProcessGroup *pg = p_owner ? (ProcessGroup *)p_owner->data.process_group : &default_process_group;
+ 
++#if 1 // Quarry release parity
++	if (!p_owner && this == singleton && quarry_process_prefix_enabled()) {
++		if (p_node->is_processing() || p_node->is_processing_internal()) {
++			ERR_FAIL_COND(!quarry_erase_process_prefix(pg->nodes, p_node, quarry_process_prefix.idle));
++		}
++		if (p_node->is_physics_processing() || p_node->is_physics_processing_internal()) {
++			ERR_FAIL_COND(!quarry_erase_process_prefix(pg->physics_nodes, p_node, quarry_process_prefix.physics));
++		}
++		return;
++	}
++#endif
++
+ 	if (p_node->is_processing() || p_node->is_processing_internal()) {
+ 		bool found = pg->nodes.erase(p_node);
+ 		ERR_FAIL_COND(!found);
+@@ -1599,14 +2763,50 @@ void SceneTree::get_nodes_in_group(const StringName &p_group, List<Node *> *p_li
+ 
+ void SceneTree::_flush_delete_queue() {
+ 	_THREAD_SAFE_METHOD_
++#ifdef DEBUG_ENABLED
++	QuarryDeleteFlush quarry_flush;
++	QuarryDeleteBranchData *quarry_stats = quarry_flush.active ? &quarry_delete_stats[quarry_delete_branch] : nullptr;
++	const bool quarry_sites = quarry_stats && quarry_delete_sites_requested();
++#endif
+ 
+ 	while (delete_queue.size()) {
+ 		Object *obj = ObjectDB::get_instance(delete_queue.front()->get());
+ 		if (obj) {
+-			memdelete(obj);
++#ifdef DEBUG_ENABLED
++			if (quarry_stats) {
++				const String label = quarry_delete_label(obj);
++				QuarryDelete::Root root;
++				const uint64_t started = OS::get_singleton()->get_ticks_usec();
++				root.last = started;
++				root.visits[QuarryDelete::DESTRUCTOR] = 1;
++				if (quarry_sites) {
++					QuarryDelete::current = &root;
++				}
++				memdelete(obj);
++				const uint64_t ended = OS::get_singleton()->get_ticks_usec();
++				QuarryDelete::current = nullptr;
++				root.account(ended);
++				quarry_delete_record(*quarry_stats, label, root, quarry_sites, root.last - started);
++			} else
++#endif
++			{
++				memdelete(obj);
++			}
++		}
++#ifdef DEBUG_ENABLED
++		else if (quarry_stats) {
++			++quarry_stats->stale;
+ 		}
++#endif
+ 		delete_queue.pop_front();
+ 	}
++#ifdef DEBUG_ENABLED
++	if (quarry_stats) {
++		const uint64_t ended = OS::get_singleton()->get_ticks_usec();
++		quarry_stats->flush_us += ended >= quarry_flush.start ? ended - quarry_flush.start : 0;
++		++quarry_stats->flushes;
++	}
++#endif
+ }
+ 
+ void SceneTree::queue_delete(Object *p_object) {
+@@ -1855,6 +3055,9 @@ bool SceneTree::is_multiplayer_poll_enabled() const {
+ }
+ 
+ void SceneTree::_bind_methods() {
++#ifdef QUARRY_NATIVE_TRANSFORM_ATTRIBUTION
++	ClassDB::bind_static_method(get_class_static(), D_METHOD("_quarry_transform_attribution_window", "active"), &quarry_transform_window);
++#endif
+ 	ClassDB::bind_method(D_METHOD("get_root"), &SceneTree::get_root);
+ 	ClassDB::bind_method(D_METHOD("has_group", "name"), &SceneTree::has_group);
+ 
+@@ -2016,6 +3219,9 @@ void SceneTree::set_disable_node_threading(bool p_disable) {
+ SceneTree::SceneTree() {
+ 	if (singleton == nullptr) {
+ 		singleton = this;
++#if 1 // Quarry release parity
++		quarry_process_prefix.reset();
++#endif
+ 	}
+ 	debug_collisions_color = GLOBAL_DEF("debug/shapes/collision/shape_color", Color(0.0, 0.6, 0.7, 0.42));
+ 	debug_collision_contact_color = GLOBAL_DEF("debug/shapes/collision/contact_color", Color(1.0, 0.2, 0.1, 0.8));
+diff --git a/scene/main/scene_tree.h b/scene/main/scene_tree.h
+index 1b4ad6b..2563b54 100644
+--- a/scene/main/scene_tree.h
++++ b/scene/main/scene_tree.h
+@@ -255,6 +255,12 @@ private:
+ 
+ 	SelfList<Node>::List xform_change_list;
+ 
++#ifndef _3D_DISABLED
++	friend class VisualInstance3D;
++	LocalVector<ObjectID> quarry_render_transforms;
++	void _quarry_flush_render_transforms();
++#endif
++
+ #ifdef DEBUG_ENABLED // No live editor in release build.
+ 	friend class LiveEditor;
+ #endif
+diff --git a/servers/rendering/renderer_scene_cull.cpp b/servers/rendering/renderer_scene_cull.cpp
+index 0c84348..06d7720 100644
+--- a/servers/rendering/renderer_scene_cull.cpp
++++ b/servers/rendering/renderer_scene_cull.cpp
+@@ -30,7 +30,12 @@
+ 
+ #include "renderer_scene_cull.h"
+ 
++#include "scene/main/quarry_delete_profiler.h"
++
+ #include "core/config/project_settings.h"
++#if 1 // Quarry release parity
++#include "core/config/engine.h"
++#endif
+ #include "core/object/worker_thread_pool.h"
+ #include "rendering_light_culler.h"
+ #include "rendering_server_default.h"
+@@ -4140,6 +4145,7 @@ void RendererSceneCull::_update_dirty_instance(Instance *p_instance) const {
+ }
+ 
+ void RendererSceneCull::update_dirty_instances() const {
++	QUARRY_DELETE_SCOPE(CULL_DIRTY_DRAIN);
+ 	while (_instance_update_list.first()) {
+ 		_update_dirty_instance(_instance_update_list.first()->self());
+ 	}
+@@ -4196,9 +4202,30 @@ bool RendererSceneCull::free(RID p_rid) {
+ 	} else if (instance_owner.owns(p_rid)) {
+ 		// delete the instance
+ 
+-		update_dirty_instances();
+-
+ 		Instance *instance = instance_owner.get_or_null(p_rid);
++		bool local_flush_only = false;
++#if 1 // Quarry release parity
++		static const bool local_flush_requested = OS::get_singleton()->get_environment("QUARRY_RENDER_LOCAL_DETACHED_FREE") == "1";
++		if (local_flush_requested && !RSG::threaded && Thread::is_main_thread() && Engine::get_singleton()->is_in_physics_frame()) {
++			const RS::InstanceType type = instance->base_type;
++			// The Node's EXIT_WORLD already unpaired it and removed it from the
++			// scenario. Keep the global barrier for any remaining renderer links.
++			local_flush_only = (type == RS::INSTANCE_NONE || type == RS::INSTANCE_MESH || type == RS::INSTANCE_PARTICLES) &&
++					!instance->scenario && !instance->scenario_item.in_list() && !instance->indexer_id.is_valid() &&
++					instance->array_index == -1 && instance->visibility_index == -1 && !instance->pairs.first() &&
++					!instance->visibility_parent && instance->visibility_dependencies.is_empty() &&
++					!instance->lightmap && !instance->skeleton.is_valid();
++		}
++#endif
++
++		auto flush_for_free = [&]() {
++			if (!local_flush_only) {
++				update_dirty_instances();
++			} else if (instance->update_item.in_list()) {
++				_update_dirty_instance(instance);
++			}
++		};
++		flush_for_free();
+ 
+ 		instance_geometry_set_lightmap(p_rid, RID(), Rect2(), 0);
+ 		instance_set_scenario(p_rid, RID());
+@@ -4208,7 +4235,7 @@ bool RendererSceneCull::free(RID p_rid) {
+ 		instance_attach_skeleton(p_rid, RID());
+ 
+ 		instance->instance_uniforms.free(instance->self);
+-		update_dirty_instances(); //in case something changed this
++		flush_for_free(); //in case something changed this
+ 
+ 		instance_owner.free(p_rid);
+ 	} else {
+diff --git a/servers/rendering/rendering_device.cpp b/servers/rendering/rendering_device.cpp
+index eb7d27e..857b0e4 100644
+--- a/servers/rendering/rendering_device.cpp
++++ b/servers/rendering/rendering_device.cpp
+@@ -29,6 +29,8 @@
+ /**************************************************************************/
+ 
+ #include "rendering_device.h"
++
++#include "scene/main/quarry_delete_profiler.h"
+ #include "rendering_device.compat.inc"
+ 
+ #include "rendering_device_binds.h"
+@@ -161,6 +163,7 @@ void RenderingDevice::_add_dependency(RID p_id, RID p_depends_on) {
+ }
+ 
+ void RenderingDevice::_free_dependencies(RID p_id) {
++	QUARRY_DELETE_SCOPE(RD_DEPS);
+ 	_THREAD_SAFE_METHOD_
+ 
+ 	// Direct dependencies must be freed.
+@@ -6051,6 +6054,7 @@ void RenderingDevice::free(RID p_id) {
+ }
+ 
+ void RenderingDevice::_free_internal(RID p_id) {
++	QUARRY_DELETE_SCOPE(RD_FREE);
+ #ifdef DEV_ENABLED
+ 	String resource_name;
+ 	if (resource_names.has(p_id)) {
+diff --git a/servers/rendering/rendering_server_default.cpp b/servers/rendering/rendering_server_default.cpp
+index 6d9d647..10f07f1 100644
+--- a/servers/rendering/rendering_server_default.cpp
++++ b/servers/rendering/rendering_server_default.cpp
+@@ -30,6 +30,8 @@
+ 
+ #include "rendering_server_default.h"
+ 
++#include "scene/main/quarry_delete_profiler.h"
++
+ #include "core/os/os.h"
+ #include "renderer_canvas_cull.h"
+ #include "renderer_scene_cull.h"
+@@ -42,6 +44,7 @@ int RenderingServerDefault::changes = 0;
+ /* FREE */
+ 
+ void RenderingServerDefault::_free(RID p_rid) {
++	QUARRY_DELETE_SCOPE(RENDER_FREE);
+ 	if (unlikely(p_rid.is_null())) {
+ 		return;
+ 	}
+@@ -209,7 +212,18 @@ double RenderingServerDefault::get_frame_setup_time_cpu() const {
+ 	return frame_setup_time;
+ }
+ 
++#if defined(DEBUG_ENABLED) && !defined(_3D_DISABLED)
++bool quarry_sprite_uploads_pending();
++void quarry_flush_sprite_uploads_before_draw();
++void quarry_report_sprite_uploads();
++#endif
++
+ bool RenderingServerDefault::has_changed() const {
++#if defined(DEBUG_ENABLED) && !defined(_3D_DISABLED)
++	if (quarry_sprite_uploads_pending()) {
++		return true;
++	}
++#endif
+ 	return changes > 0;
+ }
+ 
+@@ -265,6 +279,9 @@ void RenderingServerDefault::init() {
+ }
+ 
+ void RenderingServerDefault::finish() {
++#if defined(DEBUG_ENABLED) && !defined(_3D_DISABLED)
++	quarry_report_sprite_uploads();
++#endif
+ 	if (create_thread) {
+ 		command_queue.push(this, &RenderingServerDefault::_finish);
+ 		command_queue.push(this, &RenderingServerDefault::_thread_exit);
+@@ -419,7 +436,13 @@ void RenderingServerDefault::sync() {
+ void RenderingServerDefault::draw(bool p_present, double frame_step) {
+ 	ERR_FAIL_COND_MSG(!Thread::is_main_thread(), "Manually triggering the draw function from the RenderingServer can only be done on the main thread. Call this function from the main thread or use call_deferred().");
+ 	// Needs to be done before changes is reset to 0, to not force the editor to redraw.
++#if defined(DEBUG_ENABLED) && !defined(_3D_DISABLED)
++	quarry_flush_sprite_uploads_before_draw();
++#endif
+ 	RS::get_singleton()->emit_signal(SNAME("frame_pre_draw"));
++#if defined(DEBUG_ENABLED) && !defined(_3D_DISABLED)
++	quarry_flush_sprite_uploads_before_draw();
++#endif
+ 	changes = 0;
+ 	if (create_thread) {
+ 		command_queue.push(this, &RenderingServerDefault::_draw, p_present, frame_step);
+diff --git a/thirdparty/jolt_physics/Jolt/Physics/Constraints/ContactConstraintManager.cpp b/thirdparty/jolt_physics/Jolt/Physics/Constraints/ContactConstraintManager.cpp
+index 687ab89..2d16ccb 100644
+--- a/thirdparty/jolt_physics/Jolt/Physics/Constraints/ContactConstraintManager.cpp
++++ b/thirdparty/jolt_physics/Jolt/Physics/Constraints/ContactConstraintManager.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: MIT
+ 
+ #include <Jolt/Jolt.h>
++#include <Jolt/Physics/QuarryFindSplit.h>
+ 
+ #include <Jolt/Physics/Constraints/ContactConstraintManager.h>
+ #include <Jolt/Physics/Constraints/CalculateSolverSteps.h>
+@@ -819,7 +820,10 @@ void ContactConstraintManager::GetContactsFromCache(ContactAllocator &ioContactA
+ 	const ManifoldCache &read_cache = mCache[mCacheWriteIdx ^ 1];
+ 	const BPKeyValue *kv = read_cache.Find(body_pair_key, body_pair_hash);
+ 	if (kv == nullptr)
++	{
++		QuarryFindSplit::incr(&QuarryFindSplit::Totals::cache_missing_record);
+ 		return;
++	}
+ 	const CachedBodyPair &input_cbp = kv->GetValue();
+ 
+ 	// Get relative translation
+@@ -831,7 +835,10 @@ void ContactConstraintManager::GetContactsFromCache(ContactAllocator &ioContactA
+ 
+ 	// Check if bodies are still roughly in the same relative position
+ 	if ((delta_position - old_delta_position).LengthSq() > mPhysicsSettings.mBodyPairCacheMaxDeltaPositionSq)
++	{
++		QuarryFindSplit::incr(&QuarryFindSplit::Totals::cache_position_reject);
+ 		return;
++	}
+ 
+ 	// Determine relative orientation
+ 	Quat delta_rotation = inv_r1 * body2->GetRotation();
+@@ -844,7 +851,10 @@ void ContactConstraintManager::GetContactsFromCache(ContactAllocator &ioContactA
+ 	// From the W component we can extract the angle: cos(angle / 2) = px * qx + py * qy + pz * qz + pw * qw = p . q
+ 	// Since we want to abort if the rotation is smaller than -angle or bigger than angle, we can write the comparison as |p . q| < cos(angle / 2)
+ 	if (abs(delta_rotation.Dot(old_delta_rotation)) < mPhysicsSettings.mBodyPairCacheCosMaxDeltaRotationDiv2)
++	{
++		QuarryFindSplit::incr(&QuarryFindSplit::Totals::cache_rotation_reject);
+ 		return;
++	}
+ 
+ 	// The cache is valid, return that we've handled this body pair
+ 	outPairHandled = true;
+@@ -853,13 +863,19 @@ void ContactConstraintManager::GetContactsFromCache(ContactAllocator &ioContactA
+ 	ManifoldCache &write_cache = mCache[mCacheWriteIdx];
+ 	BPKeyValue *output_bp_kv = write_cache.Create(ioContactAllocator, body_pair_key, body_pair_hash);
+ 	if (output_bp_kv == nullptr)
+-		return; // Out of cache space
++	{
++		QuarryFindSplit::incr(&QuarryFindSplit::Totals::cache_write_full);
++		return;
++	} // Out of cache space
+ 	CachedBodyPair *output_cbp = &output_bp_kv->GetValue();
+ 	memcpy(output_cbp, &input_cbp, sizeof(CachedBodyPair));
+ 
+ 	// If there were no contacts, we have handled the contact
+ 	if (input_cbp.mFirstCachedManifold == ManifoldMap::cInvalidHandle)
++	{
++		QuarryFindSplit::incr(&QuarryFindSplit::Totals::cache_zero_manifolds);
+ 		return;
++	}
+ 
+ 	// Get body transforms
+ 	RMat44 transform_body1 = body1->GetCenterOfMassTransform();
+diff --git a/thirdparty/jolt_physics/Jolt/Physics/PhysicsSystem.cpp b/thirdparty/jolt_physics/Jolt/Physics/PhysicsSystem.cpp
+index 507ed4c..d844b20 100644
+--- a/thirdparty/jolt_physics/Jolt/Physics/PhysicsSystem.cpp
++++ b/thirdparty/jolt_physics/Jolt/Physics/PhysicsSystem.cpp
+@@ -3,6 +3,7 @@
+ // SPDX-License-Identifier: MIT
+ 
+ #include <Jolt/Jolt.h>
++#include <Jolt/Physics/QuarryFindSplit.h>
+ 
+ #include <Jolt/Physics/PhysicsSystem.h>
+ #include <Jolt/Physics/PhysicsSettings.h>
+@@ -832,6 +833,7 @@ static void sFinalizeContactAllocator(PhysicsUpdateContext::Step &ioStep, const
+ JPH_TSAN_NO_SANITIZE
+ void PhysicsSystem::JobFindCollisions(PhysicsUpdateContext::Step *ioStep, int inJobIndex)
+ {
++	QuarryFindSplit::Job quarry_timing;
+ #ifdef JPH_ENABLE_ASSERTS
+ 	// We read positions and read velocities (for elastic collisions)
+ 	BodyAccess::Grant grant(BodyAccess::EAccess::Read, BodyAccess::EAccess::Read);
+@@ -876,11 +878,14 @@ void PhysicsSystem::JobFindCollisions(PhysicsUpdateContext::Step *ioStep, int in
+ 					// Callback function when a body pair is found
+ 					virtual void			AddHit(const BodyPair &inPair) override
+ 					{
++						QuarryFindSplit::incr(&QuarryFindSplit::Totals::candidate_pairs);
+ 						// Check if we have space in our write queue
+ 						PhysicsUpdateContext::BodyPairQueue &queue = mStep->mBodyPairQueues[mJobIndex];
+ 						uint32 body_pairs_in_queue = queue.mWriteIdx - queue.mReadIdx;
+ 						if (body_pairs_in_queue >= mStep->mMaxBodyPairsPerQueue)
+ 						{
++							QuarryFindSplit::incr(&QuarryFindSplit::Totals::inline_pairs);
++							QuarryFindSplit::Scope quarry_inline(QuarryFindSplit::field(&QuarryFindSplit::Totals::inline_pair_ns));
+ 							// Buffer full, process the pair now
+ 							mStep->mContext->mPhysicsSystem->ProcessBodyPair(mContactAllocator, inPair);
+ 						}
+@@ -904,7 +909,12 @@ void PhysicsSystem::JobFindCollisions(PhysicsUpdateContext::Step *ioStep, int in
+ 				memcpy(active_bodies, mBodyManager.GetActiveBodiesUnsafe(EBodyType::RigidBody) + active_bodies_read_idx, batch_size * sizeof(BodyID));
+ 
+ 				// Find pairs in the broadphase
+-				mBroadPhase->FindCollidingPairs(active_bodies, batch_size, mPhysicsSettings.mSpeculativeContactDistance, *mObjectVsBroadPhaseLayerFilter, *mObjectLayerPairFilter, add_pair);
++				QuarryFindSplit::incr(&QuarryFindSplit::Totals::broad_batches);
++				QuarryFindSplit::incr(&QuarryFindSplit::Totals::active_bodies, batch_size);
++				{
++					QuarryFindSplit::Scope quarry_broad(QuarryFindSplit::field(&QuarryFindSplit::Totals::broad_ns));
++					mBroadPhase->FindCollidingPairs(active_bodies, batch_size, mPhysicsSettings.mSpeculativeContactDistance, *mObjectVsBroadPhaseLayerFilter, *mObjectLayerPairFilter, add_pair);
++				}
+ 
+ 				// Check if we have enough pairs in the buffer to start a new job
+ 				const PhysicsUpdateContext::BodyPairQueue &queue = ioStep->mBodyPairQueues[inJobIndex];
+@@ -984,6 +994,8 @@ void PhysicsSystem::sDefaultSimCollideBodyVsBody(const Body &inBody1, const Body
+ 
+ void PhysicsSystem::ProcessBodyPair(ContactAllocator &ioContactAllocator, const BodyPair &inBodyPair)
+ {
++	QuarryFindSplit::incr(&QuarryFindSplit::Totals::pairs);
++	QuarryFindSplit::Scope quarry_pair(QuarryFindSplit::field(&QuarryFindSplit::Totals::pair_ns));
+ 	JPH_PROFILE_FUNCTION();
+ 
+ 	// Fetch body pair
+@@ -1011,19 +1023,53 @@ void PhysicsSystem::ProcessBodyPair(ContactAllocator &ioContactAllocator, const
+ 		|| (body1->GetMotionType() == body2->GetMotionType() && inBodyPair.mBodyB < inBodyPair.mBodyA))
+ 		std::swap(body1, body2);
+ 
++	const bool quarry_sensor = QuarryFindSplit::current && (body1->IsSensor() || body2->IsSensor());
++	if (quarry_sensor) QuarryFindSplit::incr(&QuarryFindSplit::Totals::sensor_pairs);
++
+ 	// Check if the contact points from the previous frame are reusable and if so copy them
+ 	bool pair_handled = false, constraint_created = false;
+ 	if (mPhysicsSettings.mUseBodyPairContactCache && !(body1->IsCollisionCacheInvalid() || body2->IsCollisionCacheInvalid()))
++	{
++		auto *timing = QuarryFindSplit::current;
++		const bool measure = QuarryFindSplit::clock_current;
++		const auto started = measure ? QuarryFindSplit::now_ns() : 0;
+ 		mContactManager.GetContactsFromCache(ioContactAllocator, *body1, *body2, pair_handled, constraint_created);
++		if (timing)
++		{
++			const auto elapsed = measure ? QuarryFindSplit::now_ns() - started : 0;
++			++timing->cache_lookups;
++			if (pair_handled)
++			{
++				++timing->cache_hits;
++				timing->cache_hit_ns += elapsed;
++			}
++			else
++			{
++				++timing->cache_misses;
++				timing->cache_miss_ns += elapsed;
++			}
++		}
++	}
++	else QuarryFindSplit::incr(&QuarryFindSplit::Totals::cache_bypass);
+ 
+ 	// If the cache hasn't handled this body pair do actual collision detection
+ 	if (!pair_handled)
+ 	{
+ 		// Create entry in the cache for this body pair
+ 		// Needs to happen irrespective if we found a collision or not (we want to remember that no collision was found too)
+-		ContactConstraintManager::BodyPairHandle body_pair_handle = mContactManager.AddBodyPair(ioContactAllocator, *body1, *body2);
++		QuarryFindSplit::incr(&QuarryFindSplit::Totals::new_body_pairs);
++		ContactConstraintManager::BodyPairHandle body_pair_handle;
++		{
++			QuarryFindSplit::Scope quarry_insert(QuarryFindSplit::field(&QuarryFindSplit::Totals::insert_ns));
++			body_pair_handle = mContactManager.AddBodyPair(ioContactAllocator, *body1, *body2);
++		}
+ 		if (body_pair_handle == nullptr)
++		{
++			QuarryFindSplit::incr(&QuarryFindSplit::Totals::new_body_pair_full);
+ 			return; // Out of cache space
++		}
++		QuarryFindSplit::incr(&QuarryFindSplit::Totals::narrow_pairs);
++		QuarryFindSplit::Scope quarry_narrow(QuarryFindSplit::field(&QuarryFindSplit::Totals::narrow_ns));
+ 
+ 		// Create the query settings
+ 		CollideShapeSettings settings;
+@@ -1156,7 +1202,10 @@ void PhysicsSystem::ProcessBodyPair(ContactAllocator &ioContactAllocator, const
+ 			ReductionCollideShapeCollector collector(this, body1, body2);
+ 
+ 			// Perform collision detection between the two shapes
+-			mSimCollideBodyVsBody(*body1, *body2, transform1, transform2, settings, collector, shape_filter);
++			{
++				QuarryFindSplit::Scope quarry_shape(QuarryFindSplit::field(quarry_sensor ? &QuarryFindSplit::Totals::sensor_shape_ns : &QuarryFindSplit::Totals::shape_ns));
++				mSimCollideBodyVsBody(*body1, *body2, transform1, transform2, settings, collector, shape_filter);
++			}
+ 
+ 			// Add the contacts
+ 			for (ContactManifold &manifold : collector.mManifolds)
+@@ -1255,7 +1304,10 @@ void PhysicsSystem::ProcessBodyPair(ContactAllocator &ioContactAllocator, const
+ 			NonReductionCollideShapeCollector collector(this, ioContactAllocator, body1, body2, body_pair_handle);
+ 
+ 			// Perform collision detection between the two shapes
+-			mSimCollideBodyVsBody(*body1, *body2, transform1, transform2, settings, collector, shape_filter);
++			{
++				QuarryFindSplit::Scope quarry_shape(QuarryFindSplit::field(quarry_sensor ? &QuarryFindSplit::Totals::sensor_shape_ns : &QuarryFindSplit::Totals::shape_ns));
++				mSimCollideBodyVsBody(*body1, *body2, transform1, transform2, settings, collector, shape_filter);
++			}
+ 
+ 			constraint_created = collector.mConstraintCreated;
+ 		}

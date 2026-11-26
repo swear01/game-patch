@@ -1,0 +1,118 @@
+diff --git a/src-bridge/speedpatch/speedpatch.cpp b/src-bridge/speedpatch/speedpatch.cpp
+index 509dc35..3478158 100644
+--- a/src-bridge/speedpatch/speedpatch.cpp
++++ b/src-bridge/speedpatch/speedpatch.cpp
+@@ -20,16 +20,24 @@
+  */
+ #include <windows.h>
+ #include <winternl.h>
+-#include "Minhook.h"
++#include "MinHook.h"
+ #include "speedpatch.h"
+ #include <atomic>
+ #include <mmsystem.h>
+ #include <shared_mutex>
++#include <cmath>
+ #pragma comment(lib, "winmm.lib")
++// The controller and injected games must see the same speed value.
++#if defined(__MINGW32__)
++__attribute__((section("shared"), used))
++#else
+ #pragma data_seg("shared")
++#endif
+ static std::atomic<double> factor = 1.0;
++#if !defined(__MINGW32__)
+ #pragma data_seg()
+ #pragma comment(linker, "/section:shared,RWS")
++#endif
+ 
+ static std::shared_mutex mutex;
+ static std::atomic<double> pre_factor = 1.0;
+@@ -378,11 +386,14 @@ ULONGLONG WINAPI Hook_GetTickCount64(VOID)
+     return baseHook + delta;
+ }
+ 
+-static std::atomic<LARGE_INTEGER> baseReal_QueryPerformanceCounter{};
+-static std::atomic<LARGE_INTEGER> baseHook_QueryPerformanceCounter{};
+-static std::atomic<LARGE_INTEGER> lastReal_QueryPerformanceCounter{};
+-static std::atomic<LARGE_INTEGER> lastHook_QueryPerformanceCounter{};
+-static std::atomic<bool> shouldUpdateQueryPerformanceCounter = false;
++// The original code reloaded the shared factor and four independent
++// timestamps during each read. A concurrent rebase could pair unrelated
++// timestamps and return a value before the last observation.
++static SRWLOCK qpc_lock = SRWLOCK_INIT;
++static LONGLONG qpc_last_real = 0;
++static LONGLONG qpc_value = 0;
++static double qpc_carry = 0;
++static double qpc_speed = 1;
+ 
+ typedef BOOL (WINAPI* QUERYPERFORMANCECOUNTER) (LARGE_INTEGER*);
+ 
+@@ -395,29 +406,25 @@ BOOL WINAPI Hook_QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount)
+     {
+         return FALSE;
+     }
+-    if (pre_factor != SpeedFactor())
++    AcquireSRWLockExclusive(&qpc_lock);
++    LARGE_INTEGER now{};
++    const BOOL ok = Real_QueryPerformanceCounter(&now);
++    if (ok)
+     {
+-        pre_factor = SpeedFactor();
+-        shouldUpdateAll();
++        if (now.QuadPart >= qpc_last_real)
++        {
++            const double scaled = static_cast<double>(now.QuadPart - qpc_last_real) * qpc_speed + qpc_carry;
++            const auto whole = static_cast<LONGLONG>(scaled);
++            qpc_value += whole;
++            qpc_carry = scaled - static_cast<double>(whole);
++            qpc_last_real = now.QuadPart;
++        }
++        const double requested = SpeedFactor();
++        qpc_speed = std::isfinite(requested) && requested > 0 ? requested : 1.0;
++        lpPerformanceCount->QuadPart = qpc_value;
+     }
+-    // 更新基准时间点
+-    bool expected = true;
+-    if (shouldUpdateQueryPerformanceCounter.compare_exchange_weak(expected, false))
+-    {
+-        baseReal_QueryPerformanceCounter.store(lastReal_QueryPerformanceCounter.load());
+-        baseHook_QueryPerformanceCounter.store(lastHook_QueryPerformanceCounter.load());
+-    }
+-    LARGE_INTEGER now;
+-    BOOL rtncode = Real_QueryPerformanceCounter(&now);
+-    lastReal_QueryPerformanceCounter.store(now);
+-    LARGE_INTEGER baseReal = baseReal_QueryPerformanceCounter.load();
+-    LARGE_INTEGER baseHook = baseHook_QueryPerformanceCounter.load();
+-    LONGLONG delta = SpeedFactor() * (now.QuadPart - baseReal.QuadPart);
+-    LARGE_INTEGER result;
+-    result.QuadPart = baseHook.QuadPart + delta;
+-    *lpPerformanceCount = result;
+-    lastHook_QueryPerformanceCounter.store(result);
+-    return rtncode;
++    ReleaseSRWLockExclusive(&qpc_lock);
++    return ok;
+ }
+ 
+ static std::atomic<FILETIME> baseReal_GetSystemTimeAsFileTime({ 0 });
+@@ -544,7 +551,6 @@ inline VOID shouldUpdateAll()
+     shouldUpdateGetMessageTime = true;
+     shouldUpdateGetTickCount = true;
+     shouldUpdateGetTickCount64 = true;
+-    shouldUpdateQueryPerformanceCounter = true;
+     shouldUpdateGetSystemTimeAsFileTime = true;
+     shouldUpdateGetSystemTimePreciseAsFileTime = true;
+ }
+@@ -615,10 +621,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
+             /* Initial QueryPerformanceCounter */
+             LARGE_INTEGER qpc;
+             QueryPerformanceCounter(&qpc);
+-            baseReal_QueryPerformanceCounter.store(qpc);
+-            lastReal_QueryPerformanceCounter.store(qpc);
+-            baseHook_QueryPerformanceCounter.store(qpc);
+-            lastHook_QueryPerformanceCounter.store(qpc);
++            qpc_last_real = qpc.QuadPart;
++            qpc_value = qpc.QuadPart;
+ 
+             /* Initial GetSystemTimeAsFileTime */
+             GetSystemTimeAsFileTime(&now);

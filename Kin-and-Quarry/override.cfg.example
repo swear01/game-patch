@@ -1,0 +1,8 @@
+[autoload]
+projectile_pool="*<game-directory>/quarry-projectile-pool.gd"
+blocks="*<game-directory>/quarry-damage-queue.gd"
+block_pool="*<game-directory>/quarry-block-pool.gd"
+QuarryOpenSpeedy="*<game-directory>/quarry-openspeedy.gd"
+
+[threading]
+worker_pool/max_threads=4

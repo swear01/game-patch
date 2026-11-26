@@ -1,0 +1,137 @@
+{
+  "game": "Max Manos",
+  "scene": "Temporary synthetic load: 300 Square + 300 Triangle; not the original late-game chain explosion scene",
+  "settings": {
+    "vsync": 0,
+    "numbers": 1,
+    "fullscreen": 1,
+    "sleepMargin": 10
+  },
+  "method": "External unhooked wall-clock, about 8 seconds; read-only engine update counter; not the virtual-clock fps display",
+  "active10x": {
+    "label": "hundredx-active-10x-valid-a",
+    "pid": 20448,
+    "factor": 10.0,
+    "duration_s": 8.000904799991986,
+    "mean_steps_s": 202.8520574325076,
+    "speed_vs_60": 3.3808676238751265,
+    "points": [
+      {
+        "seconds": 1.0,
+        "steps_s": 201.99
+      },
+      {
+        "seconds": 2.002,
+        "steps_s": 208.68
+      },
+      {
+        "seconds": 3.004,
+        "steps_s": 204.5
+      },
+      {
+        "seconds": 4.005,
+        "steps_s": 204.85
+      },
+      {
+        "seconds": 5.007,
+        "steps_s": 197.61
+      },
+      {
+        "seconds": 6.009,
+        "steps_s": 201.56
+      },
+      {
+        "seconds": 7.009,
+        "steps_s": 200.95
+      }
+    ]
+  },
+  "active100x": {
+    "label": "hundredx-active-100x-valid-a",
+    "pid": 20448,
+    "factor": 100.0,
+    "duration_s": 8.002281799999764,
+    "mean_steps_s": 194.56950391325208,
+    "speed_vs_60": 3.242825065220868,
+    "points": [
+      {
+        "seconds": 1.0,
+        "steps_s": 182.95
+      },
+      {
+        "seconds": 2.0,
+        "steps_s": 200.96
+      },
+      {
+        "seconds": 3.001,
+        "steps_s": 199.81
+      },
+      {
+        "seconds": 4.002,
+        "steps_s": 201.81
+      },
+      {
+        "seconds": 5.003,
+        "steps_s": 207.96
+      },
+      {
+        "seconds": 6.003,
+        "steps_s": 206.87
+      },
+      {
+        "seconds": 7.005,
+        "steps_s": 164.77
+      }
+    ]
+  },
+  "ready10x": {
+    "label": "hundredx-ready-10x-valid",
+    "pid": 20448,
+    "factor": 10.0,
+    "duration_s": 8.001862999983132,
+    "mean_steps_s": 260.31437928947184,
+    "speed_vs_60": 4.338572988157864,
+    "points": [
+      {
+        "seconds": 1.001,
+        "steps_s": 253.85
+      },
+      {
+        "seconds": 2.001,
+        "steps_s": 263.92
+      },
+      {
+        "seconds": 3.003,
+        "steps_s": 264.52
+      },
+      {
+        "seconds": 4.003,
+        "steps_s": 259.91
+      },
+      {
+        "seconds": 5.005,
+        "steps_s": 261.45
+      },
+      {
+        "seconds": 6.007,
+        "steps_s": 259.6
+      },
+      {
+        "seconds": 7.009,
+        "steps_s": 261.39
+      }
+    ]
+  },
+  "limitations": [
+    "One active sample per factor; randomized shape positions; level 0 for 10x versus level 1 for 100x. Not a controlled exact-state comparison.",
+    "A preliminary run after Alt+Enter display toggling was limited to 60 updates/s and excluded. Reapplying VSync did not clear it; relaunching restored above-60 performance.",
+    "100x showed no substantial gain in this synthetic scene. This does not measure the original late-game save."
+  ],
+  "restore": {
+    "remoteSaveSha256": "3951615A10CB880EF566DCB0522D0D652AE66E3D140BE6CF4E9D62B8DBD4F07B",
+    "gameExited": true,
+    "byteIdenticalToBackups": true,
+    "speedFactor": 10,
+    "localSaveSha256": "3951615A10CB880EF566DCB0522D0D652AE66E3D140BE6CF4E9D62B8DBD4F07B"
+  }
+}

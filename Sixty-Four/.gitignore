@@ -1,0 +1,5 @@
+bridge-config.json
+installation.json
+backups/
+openspeedy-guard.exe
+*.log

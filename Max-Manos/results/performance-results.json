@@ -1,0 +1,443 @@
+{
+  "fixture": {
+    "moreTime1": 20,
+    "triangle": 300,
+    "square": 300,
+    "description": "Synthetic load, not the original late-game scene; cursor centered during active trials; randomized shape positions and level increments are confounders"
+  },
+  "game": "Max Manos",
+  "restore": {
+    "sleepMargin": 10,
+    "vsync": 0,
+    "numbers": 1,
+    "fullscreen": 1,
+    "openSpeedyFactor": 10,
+    "originalSaveSha256": "64436d175be29eb2731bd26cbda117ab35a451098944b60d9ff2f113a96121b2"
+  },
+  "measurements": [
+    {
+      "threads": [
+        {
+          "cpuSeconds": 7.671875,
+          "id": 28532
+        },
+        {
+          "cpuSeconds": 0.515625,
+          "id": 12516
+        },
+        {
+          "cpuSeconds": 0.375,
+          "id": 29628
+        },
+        {
+          "cpuSeconds": 0.046875,
+          "id": 28808
+        },
+        {
+          "cpuSeconds": 0.046875,
+          "id": 12912
+        }
+      ],
+      "cpuSeconds": 8.84375,
+      "duration": 7.7355469,
+      "gpu": [
+        "29 %, 36.89 W",
+        "33 %, 35.71 W",
+        "36 %, 35.92 W",
+        "37 %, 35.76 W",
+        "40 %, 35.63 W",
+        "33 %, 36.19 W",
+        "35 %, 36.22 W",
+        "38 %, 35.57 W"
+      ]
+    },
+    {
+      "label": "heavy-active-margin0",
+      "pid": 28480,
+      "factor": 10.0,
+      "duration_s": 8.00001920000068,
+      "mean_steps_s": 207.49950200117758,
+      "speed_vs_60": 3.4583250333529594,
+      "points": [
+        {
+          "seconds": 1.001,
+          "steps_s": 202.77
+        },
+        {
+          "seconds": 2.003,
+          "steps_s": 213.69
+        },
+        {
+          "seconds": 3.004,
+          "steps_s": 208.69
+        },
+        {
+          "seconds": 4.006,
+          "steps_s": 206.58
+        },
+        {
+          "seconds": 5.008,
+          "steps_s": 208.62
+        },
+        {
+          "seconds": 6.01,
+          "steps_s": 210.6
+        },
+        {
+          "seconds": 7.01,
+          "steps_s": 207.95
+        }
+      ]
+    },
+    {
+      "label": "heavy-active-numbers-off",
+      "pid": 6000,
+      "factor": 10.0,
+      "duration_s": 8.000861799984705,
+      "mean_steps_s": 205.85282450487378,
+      "speed_vs_60": 3.430880408414563,
+      "points": [
+        {
+          "seconds": 1.002,
+          "steps_s": 205.56
+        },
+        {
+          "seconds": 2.004,
+          "steps_s": 206.55
+        },
+        {
+          "seconds": 3.005,
+          "steps_s": 209.88
+        },
+        {
+          "seconds": 4.006,
+          "steps_s": 203.77
+        },
+        {
+          "seconds": 5.007,
+          "steps_s": 200.85
+        },
+        {
+          "seconds": 6.007,
+          "steps_s": 208.0
+        },
+        {
+          "seconds": 7.008,
+          "steps_s": 205.78
+        }
+      ]
+    },
+    {
+      "label": "heavy-active-numbers-on",
+      "pid": 6000,
+      "factor": 10.0,
+      "duration_s": 8.000953499984462,
+      "mean_steps_s": 197.97640368777,
+      "speed_vs_60": 3.2996067281294996,
+      "points": [
+        {
+          "seconds": 1.002,
+          "steps_s": 197.6
+        },
+        {
+          "seconds": 2.002,
+          "steps_s": 197.99
+        },
+        {
+          "seconds": 3.002,
+          "steps_s": 201.0
+        },
+        {
+          "seconds": 4.002,
+          "steps_s": 200.94
+        },
+        {
+          "seconds": 5.003,
+          "steps_s": 198.8
+        },
+        {
+          "seconds": 6.005,
+          "steps_s": 196.58
+        },
+        {
+          "seconds": 7.007,
+          "steps_s": 197.67
+        }
+      ]
+    },
+    {
+      "label": "heavy-ready-10x",
+      "pid": 6000,
+      "factor": 10.0,
+      "duration_s": 8.00120239998796,
+      "mean_steps_s": 258.3361720737261,
+      "speed_vs_60": 4.305602867895435,
+      "points": [
+        {
+          "seconds": 1.0,
+          "steps_s": 255.97
+        },
+        {
+          "seconds": 2.0,
+          "steps_s": 260.95
+        },
+        {
+          "seconds": 3.001,
+          "steps_s": 259.78
+        },
+        {
+          "seconds": 4.001,
+          "steps_s": 259.97
+        },
+        {
+          "seconds": 5.003,
+          "steps_s": 251.62
+        },
+        {
+          "seconds": 6.004,
+          "steps_s": 259.67
+        },
+        {
+          "seconds": 7.004,
+          "steps_s": 260.0
+        }
+      ]
+    },
+    {
+      "label": "heavy-ready-margin0-100x",
+      "pid": 28480,
+      "factor": 100.0,
+      "duration_s": 8.001079099980416,
+      "mean_steps_s": 252.2159792177207,
+      "speed_vs_60": 4.203599653628678,
+      "points": [
+        {
+          "seconds": 1.001,
+          "steps_s": 235.88
+        },
+        {
+          "seconds": 2.003,
+          "steps_s": 247.48
+        },
+        {
+          "seconds": 3.005,
+          "steps_s": 254.42
+        },
+        {
+          "seconds": 4.007,
+          "steps_s": 257.56
+        },
+        {
+          "seconds": 5.007,
+          "steps_s": 259.0
+        },
+        {
+          "seconds": 6.008,
+          "steps_s": 254.66
+        },
+        {
+          "seconds": 7.01,
+          "steps_s": 255.54
+        }
+      ]
+    },
+    {
+      "label": "heavy-ready-margin0-10x",
+      "pid": 28480,
+      "factor": 10.0,
+      "duration_s": 8.001041899988195,
+      "mean_steps_s": 258.8412891579852,
+      "speed_vs_60": 4.31402148596642,
+      "points": [
+        {
+          "seconds": 1.001,
+          "steps_s": 249.82
+        },
+        {
+          "seconds": 2.002,
+          "steps_s": 258.79
+        },
+        {
+          "seconds": 3.003,
+          "steps_s": 263.52
+        },
+        {
+          "seconds": 4.006,
+          "steps_s": 262.36
+        },
+        {
+          "seconds": 5.007,
+          "steps_s": 261.68
+        },
+        {
+          "seconds": 6.008,
+          "steps_s": 262.63
+        },
+        {
+          "seconds": 7.01,
+          "steps_s": 253.59
+        }
+      ]
+    },
+    {
+      "label": "heavy-ready-margin0-5x",
+      "pid": 28480,
+      "factor": 5.0,
+      "duration_s": 8.001345999975456,
+      "mean_steps_s": 253.95727168981733,
+      "speed_vs_60": 4.232621194830289,
+      "points": [
+        {
+          "seconds": 1.001,
+          "steps_s": 244.87
+        },
+        {
+          "seconds": 2.002,
+          "steps_s": 258.49
+        },
+        {
+          "seconds": 3.005,
+          "steps_s": 256.37
+        },
+        {
+          "seconds": 4.006,
+          "steps_s": 245.67
+        },
+        {
+          "seconds": 5.008,
+          "steps_s": 258.44
+        },
+        {
+          "seconds": 6.009,
+          "steps_s": 254.97
+        },
+        {
+          "seconds": 7.009,
+          "steps_s": 255.98
+        }
+      ]
+    },
+    {
+      "label": "heavy-ready-numbers-off",
+      "pid": 6000,
+      "factor": 10.0,
+      "duration_s": 8.001174599980004,
+      "mean_steps_s": 255.3375100707221,
+      "speed_vs_60": 4.255625167845368,
+      "points": [
+        {
+          "seconds": 1.002,
+          "steps_s": 253.39
+        },
+        {
+          "seconds": 2.003,
+          "steps_s": 257.72
+        },
+        {
+          "seconds": 3.004,
+          "steps_s": 253.96
+        },
+        {
+          "seconds": 4.005,
+          "steps_s": 252.56
+        },
+        {
+          "seconds": 5.006,
+          "steps_s": 254.83
+        },
+        {
+          "seconds": 6.007,
+          "steps_s": 256.86
+        },
+        {
+          "seconds": 7.009,
+          "steps_s": 257.47
+        }
+      ]
+    },
+    {
+      "label": "heavy-ready-window",
+      "pid": 6000,
+      "factor": 10.0,
+      "duration_s": 8.000903300009668,
+      "mean_steps_s": 59.993226014795106,
+      "speed_vs_60": 0.9998871002465851,
+      "points": [
+        {
+          "seconds": 1.001,
+          "steps_s": 59.92
+        },
+        {
+          "seconds": 2.003,
+          "steps_s": 60.92
+        },
+        {
+          "seconds": 3.005,
+          "steps_s": 59.88
+        },
+        {
+          "seconds": 4.006,
+          "steps_s": 59.94
+        },
+        {
+          "seconds": 5.008,
+          "steps_s": 59.86
+        },
+        {
+          "seconds": 6.009,
+          "steps_s": 59.96
+        },
+        {
+          "seconds": 7.011,
+          "steps_s": 59.87
+        }
+      ]
+    },
+    {
+      "label": "menu-calibration",
+      "pid": 6000,
+      "factor": 10.0,
+      "duration_s": 8.000100199977169,
+      "mean_steps_s": 591.4925915569788,
+      "speed_vs_60": 9.858209859282981,
+      "points": [
+        {
+          "seconds": 1.0,
+          "steps_s": 588.96
+        },
+        {
+          "seconds": 2.001,
+          "steps_s": 593.25
+        },
+        {
+          "seconds": 3.003,
+          "steps_s": 594.18
+        },
+        {
+          "seconds": 4.003,
+          "steps_s": 594.91
+        },
+        {
+          "seconds": 5.005,
+          "steps_s": 579.69
+        },
+        {
+          "seconds": 6.007,
+          "steps_s": 591.97
+        },
+        {
+          "seconds": 7.007,
+          "steps_s": 593.98
+        }
+      ]
+    }
+  ],
+  "conclusion": "No tested setting achieved 600 updates per wall-clock second under the synthetic combat load. Numbers-off difference was small and not established as reproducible.",
+  "date": "2026-10-12",
+  "hardware": {
+    "cpu": "AMD Ryzen 7 3700X",
+    "power": "Balanced",
+    "gpu": "NVIDIA RTX 3060"
+  },
+  "method": "External wall clock and read-only engine step counter, about 8 seconds per trial"
+}

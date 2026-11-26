@@ -1,0 +1,515 @@
+{
+  "date": "2026-10-12",
+  "game": "Max Manos Steam Windows, app 3428620",
+  "purpose": "Diagnostic rendering-frequency experiment; original installation and saves restored after testing",
+  "settings": {
+    "openspeedy_factor": 10,
+    "fullscreen": true,
+    "vsync": false,
+    "show_numbers": true,
+    "sleep_margin": 10
+  },
+  "fixture": {
+    "initial_square_count": 300,
+    "initial_triangle_count": 300,
+    "round_duration_seconds": 6000,
+    "mode": "FingerGun",
+    "initial_level": 0,
+    "late_game_chain_upgrades_reproduced": false
+  },
+  "temporary_patch": {
+    "aim_calculation": "Moved unchanged block from controller Draw GUI End to controller End Step; shared by all tested strides",
+    "drawing": "Draw events disabled for skipped action frames, enabled every frame for menus and pause",
+    "controls": "F6 cycles draw strides 1/5/10; F7 writes diagnostic state",
+    "compiler": "UndertaleModTool CLI 0.9.2.0",
+    "permanently_installed": false
+  },
+  "measurement": {
+    "clock": "External Python perf_counter unaffected by the injected game's clock hooks",
+    "counter": "Read-only GameMaker runner update counter",
+    "samples_per_mode": 2,
+    "sample_seconds": 8,
+    "sequence": [
+      "draw-normal-a",
+      "draw-stride5-a",
+      "draw-stride10-a",
+      "draw-normal-b",
+      "draw-stride5-b",
+      "draw-stride10-b"
+    ],
+    "telemetry_note": "F7 intervals bracket samples but also include UI overhead; do not treat them as exact 8-second sample windows",
+    "controls": "Normal drawing repeated after both skipped modes; fullscreen switch affected 60-step/s control excluded"
+  },
+  "summary": {
+    "normal": {
+      "draw_stride": 1,
+      "mean_steps_s": 199.29182594224017,
+      "sample_range_steps_s": [
+        194.7343725666244,
+        203.84927931785592
+      ],
+      "speed_vs_60": 3.3215304323706696,
+      "estimated_draw_events_s": 199.29182594224017,
+      "gain_over_normal_percent": 0.0
+    },
+    "stride5": {
+      "draw_stride": 5,
+      "mean_steps_s": 250.88260244439408,
+      "sample_range_steps_s": [
+        248.81292117596973,
+        252.9522837128184
+      ],
+      "speed_vs_60": 4.181376707406568,
+      "estimated_draw_events_s": 50.176520488878815,
+      "gain_over_normal_percent": 25.88705094061723
+    },
+    "stride10": {
+      "draw_stride": 10,
+      "mean_steps_s": 260.71431671447095,
+      "sample_range_steps_s": [
+        260.58531937075816,
+        260.84331405818375
+      ],
+      "speed_vs_60": 4.345238611907849,
+      "estimated_draw_events_s": 26.071431671447094,
+      "gain_over_normal_percent": 30.82037634099082
+    }
+  },
+  "samples": [
+    {
+      "label": "draw-normal-a",
+      "pid": 31676,
+      "factor": 10.0,
+      "duration_s": 8.000641999999061,
+      "mean_steps_s": 194.7343725666244,
+      "speed_vs_60": 3.2455728761104066,
+      "points": [
+        {
+          "seconds": 1.002,
+          "steps_s": 176.63
+        },
+        {
+          "seconds": 2.004,
+          "steps_s": 178.62
+        },
+        {
+          "seconds": 3.005,
+          "steps_s": 199.92
+        },
+        {
+          "seconds": 4.006,
+          "steps_s": 203.79
+        },
+        {
+          "seconds": 5.006,
+          "steps_s": 201.99
+        },
+        {
+          "seconds": 6.008,
+          "steps_s": 201.51
+        },
+        {
+          "seconds": 7.009,
+          "steps_s": 194.88
+        }
+      ]
+    },
+    {
+      "label": "draw-stride5-a",
+      "pid": 31676,
+      "factor": 10.0,
+      "duration_s": 8.001509100024123,
+      "mean_steps_s": 252.9522837128184,
+      "speed_vs_60": 4.21587139521364,
+      "points": [
+        {
+          "seconds": 1.0,
+          "steps_s": 237.94
+        },
+        {
+          "seconds": 2.001,
+          "steps_s": 249.8
+        },
+        {
+          "seconds": 3.002,
+          "steps_s": 257.87
+        },
+        {
+          "seconds": 4.002,
+          "steps_s": 260.93
+        },
+        {
+          "seconds": 5.004,
+          "steps_s": 252.52
+        },
+        {
+          "seconds": 6.006,
+          "steps_s": 253.54
+        },
+        {
+          "seconds": 7.007,
+          "steps_s": 251.64
+        }
+      ]
+    },
+    {
+      "label": "draw-stride10-a",
+      "pid": 31676,
+      "factor": 10.0,
+      "duration_s": 8.000971800007392,
+      "mean_steps_s": 260.84331405818375,
+      "speed_vs_60": 4.347388567636396,
+      "points": [
+        {
+          "seconds": 1.001,
+          "steps_s": 254.64
+        },
+        {
+          "seconds": 2.004,
+          "steps_s": 259.41
+        },
+        {
+          "seconds": 3.005,
+          "steps_s": 243.69
+        },
+        {
+          "seconds": 4.007,
+          "steps_s": 265.38
+        },
+        {
+          "seconds": 5.008,
+          "steps_s": 260.91
+        },
+        {
+          "seconds": 6.009,
+          "steps_s": 268.75
+        },
+        {
+          "seconds": 7.01,
+          "steps_s": 267.56
+        }
+      ]
+    },
+    {
+      "label": "draw-normal-b",
+      "pid": 31676,
+      "factor": 10.0,
+      "duration_s": 8.001009399973555,
+      "mean_steps_s": 203.84927931785592,
+      "speed_vs_60": 3.397487988630932,
+      "points": [
+        {
+          "seconds": 1.001,
+          "steps_s": 195.73
+        },
+        {
+          "seconds": 2.001,
+          "steps_s": 207.0
+        },
+        {
+          "seconds": 3.002,
+          "steps_s": 206.89
+        },
+        {
+          "seconds": 4.002,
+          "steps_s": 201.0
+        },
+        {
+          "seconds": 5.004,
+          "steps_s": 205.52
+        },
+        {
+          "seconds": 6.005,
+          "steps_s": 208.89
+        },
+        {
+          "seconds": 7.005,
+          "steps_s": 206.88
+        }
+      ]
+    },
+    {
+      "label": "draw-stride5-b",
+      "pid": 31676,
+      "factor": 10.0,
+      "duration_s": 8.00199600000633,
+      "mean_steps_s": 248.81292117596973,
+      "speed_vs_60": 4.146882019599496,
+      "points": [
+        {
+          "seconds": 1.001,
+          "steps_s": 233.87
+        },
+        {
+          "seconds": 2.001,
+          "steps_s": 247.93
+        },
+        {
+          "seconds": 3.002,
+          "steps_s": 234.82
+        },
+        {
+          "seconds": 4.004,
+          "steps_s": 247.43
+        },
+        {
+          "seconds": 5.005,
+          "steps_s": 259.64
+        },
+        {
+          "seconds": 6.007,
+          "steps_s": 257.47
+        },
+        {
+          "seconds": 7.009,
+          "steps_s": 253.64
+        }
+      ]
+    },
+    {
+      "label": "draw-stride10-b",
+      "pid": 31676,
+      "factor": 10.0,
+      "duration_s": 8.001218199991854,
+      "mean_steps_s": 260.58531937075816,
+      "speed_vs_60": 4.343088656179303,
+      "points": [
+        {
+          "seconds": 1.002,
+          "steps_s": 257.39
+        },
+        {
+          "seconds": 2.003,
+          "steps_s": 254.77
+        },
+        {
+          "seconds": 3.004,
+          "steps_s": 259.93
+        },
+        {
+          "seconds": 4.005,
+          "steps_s": 261.68
+        },
+        {
+          "seconds": 5.006,
+          "steps_s": 254.61
+        },
+        {
+          "seconds": 6.008,
+          "steps_s": 268.48
+        },
+        {
+          "seconds": 7.01,
+          "steps_s": 262.46
+        }
+      ]
+    }
+  ],
+  "telemetry": [
+    {
+      "total_steps": 11694.0,
+      "draw_stride": 1.0,
+      "draw_frames": 11694.0,
+      "timer_ticks_left": 359149.0,
+      "shapes_destroyed": 56.0,
+      "shards_collected": 260.0,
+      "phase": "action",
+      "aim_x": 960.0,
+      "aim_y": 500.0,
+      "aim_direction": 90.0
+    },
+    {
+      "total_steps": 14011.0,
+      "draw_stride": 1.0,
+      "draw_frames": 14011.0,
+      "timer_ticks_left": 356832.0,
+      "shapes_destroyed": 198.0,
+      "shards_collected": 520.0,
+      "phase": "action",
+      "aim_x": 960.0,
+      "aim_y": 500.0,
+      "aim_direction": 90.0
+    },
+    {
+      "total_steps": 16046.0,
+      "draw_stride": 5.0,
+      "draw_frames": 15167.0,
+      "timer_ticks_left": 354797.0,
+      "shapes_destroyed": 231.0,
+      "shards_collected": 560.0,
+      "phase": "action",
+      "aim_x": 960.0,
+      "aim_y": 500.0,
+      "aim_direction": 90.0
+    },
+    {
+      "total_steps": 19145.0,
+      "draw_stride": 5.0,
+      "draw_frames": 15787.0,
+      "timer_ticks_left": 351698.0,
+      "shapes_destroyed": 237.0,
+      "shards_collected": 560.0,
+      "phase": "action",
+      "aim_x": 960.0,
+      "aim_y": 500.0,
+      "aim_direction": 90.0
+    },
+    {
+      "total_steps": 22207.0,
+      "draw_stride": 10.0,
+      "draw_frames": 16256.0,
+      "timer_ticks_left": 348636.0,
+      "shapes_destroyed": 237.0,
+      "shards_collected": 560.0,
+      "phase": "action",
+      "aim_x": 960.0,
+      "aim_y": 500.0,
+      "aim_direction": 90.0
+    },
+    {
+      "total_steps": 25439.0,
+      "draw_stride": 10.0,
+      "draw_frames": 16579.0,
+      "timer_ticks_left": 345404.0,
+      "shapes_destroyed": 239.0,
+      "shards_collected": 560.0,
+      "phase": "action",
+      "aim_x": 960.0,
+      "aim_y": 500.0,
+      "aim_direction": 90.0
+    },
+    {
+      "total_steps": 37182.0,
+      "draw_stride": 10.0,
+      "draw_frames": 20734.0,
+      "timer_ticks_left": 333661.0,
+      "shapes_destroyed": 240.0,
+      "shards_collected": 560.0,
+      "phase": "action",
+      "aim_x": 960.0,
+      "aim_y": 500.0,
+      "aim_direction": 90.0
+    },
+    {
+      "total_steps": 39527.0,
+      "draw_stride": 10.0,
+      "draw_frames": 20968.0,
+      "timer_ticks_left": 331316.0,
+      "shapes_destroyed": 316.0,
+      "shards_collected": 840.0,
+      "phase": "action",
+      "aim_x": 693.19,
+      "aim_y": 284.83,
+      "aim_direction": 321.12
+    },
+    {
+      "total_steps": 47641.0,
+      "draw_stride": 10.0,
+      "draw_frames": 27905.0,
+      "timer_ticks_left": 330008.0,
+      "shapes_destroyed": 340.0,
+      "shards_collected": 920.0,
+      "phase": "action",
+      "aim_x": 693.19,
+      "aim_y": 284.83,
+      "aim_direction": 321.12
+    },
+    {
+      "total_steps": 50906.0,
+      "draw_stride": 10.0,
+      "draw_frames": 31170.0,
+      "timer_ticks_left": 330008.0,
+      "shapes_destroyed": 340.0,
+      "shards_collected": 920.0,
+      "phase": "action",
+      "aim_x": 693.19,
+      "aim_y": 284.83,
+      "aim_direction": 321.12
+    },
+    {
+      "total_steps": 55442.0,
+      "draw_stride": 10.0,
+      "draw_frames": 34530.0,
+      "timer_ticks_left": 328701.0,
+      "shapes_destroyed": 396.0,
+      "shards_collected": 1260.0,
+      "phase": "action",
+      "aim_x": 926.96,
+      "aim_y": 613.54,
+      "aim_direction": 125.42
+    }
+  ],
+  "consistency_checks": [
+    {
+      "draw_stride": 1.0,
+      "steps": 2317.0,
+      "timer_ticks_elapsed": 2317.0,
+      "draw_frames": 2317.0,
+      "timer_matches_steps": true,
+      "draw_count_matches_stride": true
+    },
+    {
+      "draw_stride": 5.0,
+      "steps": 3099.0,
+      "timer_ticks_elapsed": 3099.0,
+      "draw_frames": 620.0,
+      "timer_matches_steps": true,
+      "draw_count_matches_stride": true
+    },
+    {
+      "draw_stride": 10.0,
+      "steps": 3232.0,
+      "timer_ticks_elapsed": 3232.0,
+      "draw_frames": 323.0,
+      "timer_matches_steps": true,
+      "draw_count_matches_stride": true
+    }
+  ],
+  "smoke_checks": {
+    "aim_changed_with_mouse": true,
+    "hits_and_shards_increased_at_stride10": true,
+    "pause_timer_frozen": true,
+    "resume_timer_decreased": true,
+    "round_end_screen": {
+      "shapes_destroyed": 412,
+      "shards_collected": 1320,
+      "multiplier": 1.6,
+      "shards_earned": 2112
+    },
+    "returned_to_shop": true,
+    "test_save_written_money": 2112,
+    "test_save_written_level": 1
+  },
+  "limitations": [
+    "Synthetic basic-shape load, not the user's actual late-game chain-explosion battle",
+    "Two short samples per mode within a changing random scene; no deterministic replay or function-level profiler",
+    "Gameplay checks are smoke checks, not proof of equivalence across all modes, effects, and upgrades",
+    "Estimated draw-event rate is not a separately measured monitor presentation FPS",
+    "Remaining bottleneck requires profiling of Step, collision, VM and engine work; rendering is only part of the limit"
+  ],
+  "restoration": {
+    "hash_checks": [
+      {
+        "target": "data.win",
+        "sha256": "2de3c6077f0447aab07dc4a0bfe00490d77ca240259d40374affcee24dc3cf9c",
+        "matches_test_start_backup": true
+      },
+      {
+        "target": "local save",
+        "sha256": "3951615a10cb880ef566dcb0522d0d652ae66e3d140be6cf4e9d62b8dbd4f07b",
+        "matches_test_start_backup": true
+      },
+      {
+        "target": "remote save",
+        "sha256": "3951615a10cb880ef566dcb0522d0d652ae66e3d140be6cf4e9d62b8dbd4f07b",
+        "matches_test_start_backup": true
+      }
+    ],
+    "original_relaunched_and_loaded": true,
+    "original_scene_round_seconds": 20,
+    "original_scene_initial_shapes_from_save": 8,
+    "original_shop_money": 0,
+    "game_closed_after_validation": true,
+    "openspeedy_factor_unchanged": 10
+  }
+}

@@ -1,0 +1,2 @@
+# Preserve the original unified diff context and its line endings.
+*.patch -text -whitespace
