@@ -220,7 +220,8 @@ if ($Action -eq 'Stage') {
             throw "The staging directory must be empty: $stage"
         }
     } else {
-        $stage = [IO.Directory]::CreateTempSubdirectory('TimberRushAutoUpgrade-').FullName
+        $stageName = 'TimberRushAutoUpgrade-' + [guid]::NewGuid().ToString('N')
+        $stage = [IO.Directory]::CreateDirectory((Join-Path ([IO.Path]::GetTempPath()) $stageName)).FullName
     }
     $stagedGame = Join-Path $stage 'Assembly-CSharp.dll'
     $stagedHelper = Join-Path $stage "$helperName.dll"
