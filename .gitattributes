@@ -3,3 +3,7 @@
 
 # The Minutescape background packager embeds this fragment byte for byte.
 Minutescape/minutescape_speed_background.js -text whitespace=cr-at-eol
+
+# Hashes in the Shelldiver manifest identify the source bytes used for the native build.
+Shelldiver/native/src/* -text whitespace=-blank-at-eof,cr-at-eol
+Shelldiver/native/tests/*.cpp -text whitespace=-blank-at-eof,cr-at-eol

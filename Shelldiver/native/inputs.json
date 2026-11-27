@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "packageVersion": "2026.11.27-particle-render-suite",
+  "platform": "win-x64",
+  "game": {
+    "name": "Shelldiver",
+    "steamAppId": 3862670,
+    "steamBuildId": 23898569,
+    "executableSha256": "48D45832A3B2FD299BB343289A2CB4A3BFAD8755B847CF23E49EC01D65629290",
+    "dataSha256": "4B4F08B6C85FD3852A08BCCDBB0D6621CC614225F9F804DF6AFE79258E8C0506"
+  },
+  "deployedPlugin": {
+    "fileName": "ShelldiverAutoplayNative.dll",
+    "sha256": "AB42CF7662F90DB3B78CB412946342D8F81E91B793BA4EDB8DA83F4AC76976B7",
+    "bytes": 316928,
+    "deployedVerifiedUtc": "2026-11-27T19:44:52Z"
+  },
+  "dependencies": {
+    "msvcTools": "14.44.35207",
+    "aurie": {
+      "version": "2.0.2.0",
+      "url": "https://github.com/AurieFramework/Aurie",
+      "testedRuntimeSha256": "18E3A1DE980F487A6B3858B673D2030E96984DD96DE3A047B43A263A5BA829AE"
+    },
+    "yytk": {
+      "commit": "d5cc0078bfbfd5907884ad3fe0b3c6cbaa1c3f54",
+      "url": "https://github.com/AurieFramework/YYToolkit/tree/d5cc0078bfbfd5907884ad3fe0b3c6cbaa1c3f54/ExamplePlugin",
+      "testedRuntimeFileVersion": "5.0.0.0",
+      "testedRuntimeSha256": "AE7809F136F9222E5F49393D7CE7C3AD4C375C171308E2414660946D4BA0378A",
+      "sdkHashNormalization": "UTF-8, LF line endings",
+      "sdkFiles": {
+        "Aurie/shared.hpp": "074ED3413B6E3E0F5F654BB6B29AA2452A7F5F6817FBC47EABB506AABB5C72E4",
+        "FunctionWrapper/FunctionWrapper.hpp": "E72E263DCF3403EFB196552FA08F2BEEA8F46F3FF67AE16C7DE2B1599C0BCCFF",
+        "YYToolkit/YYTK_Shared_Base.hpp": "48560AAE87D0730626E14C714130CC5DB968E9C0D9873D98BFA52CE445DA0E05",
+        "YYToolkit/YYTK_Shared_Interface.hpp": "06E73D85AF6A3509BBBEC0E141F030AEC3A3F000AEC9E77E881DB0A636F95057",
+        "YYToolkit/YYTK_Shared_Types.cpp": "E00AFD868E1FE3A7C9A395ED9B6C9D5B9530695F7505F8BE22E6F8CC5D4CCFAA",
+        "YYToolkit/YYTK_Shared_Types.hpp": "FABB05BF814D18F0E9238F04613B6BBEE30B8AA1D38605FFF73F1E2D604EBC11",
+        "YYToolkit/YYTK_Shared.hpp": "6D6666F1DB2553EA0C17658BDC53E65C396BC402053D73257038E66BD713D22A"
+      }
+    },
+    "nlohmann": {
+      "version": "3.12.0",
+      "url": "https://github.com/nlohmann/json/releases/tag/v3.12.0",
+      "headerSha256": "AAF127C04CB31C406E5B04A63F1AE89369FCCDE6D8FA7CDDA1ED4F32DFC5DE63"
+    }
+  },
+  "sourceFiles": {
+    "src/ShelldiverAutoplay.cpp": "3A4D621B138D0B9FF7666F46B0CCD68C9A9908996A644B8AFBC3F255C9D589D2",
+    "src/ShelldiverDrawCadence.hpp": "A5625F7DA96CCA0744BF4290B865AE7489EE18823A62169A62EDD812357C0E7A",
+    "src/ShelldiverParticleBudget.hpp": "C452692687E39B58E3BF88A0B17B7A57343346AF1FCB7B3540F20AC1BE0D8A3E",
+    "src/ShelldiverPresentCadence.hpp": "9CF8FEBF97627BE2FB9D187271D7DBD0F43BD3362E62C98EA679511F7464CEE3",
+    "src/ShelldiverSkillTelemetry.hpp": "0393EE000DB5AE032CDAFD4F327BFB284B2E30F4B3D9D2983223CAB08A6313FD",
+    "src/ShelldiverVisualBudget.hpp": "A094D79796F86FD45667D41EB90C0D31D10D84E04C1AF9B1EE1E7712694BFF65",
+    "tests/Test-ShelldiverParticleRenderSuite.cpp": "0FAE7705B5C09E7AA03921466B54D152067AF82EF83F7BFE8B737DC695C6D228"
+  }
+}
