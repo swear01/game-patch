@@ -14,6 +14,7 @@
 | [Outhold](Outhold/) | Godot CLI 與來源封裝工具。 |
 | [Particul](Particul/) | Electron 加速和效能修正的腳本與紀錄。 |
 | [Sixty Four](Sixty-Four/) | Electron 遊戲 API、加速時鐘修正、安裝、移除及測試。 |
+| [Timber Rush](Timber-Rush/) | 依當局數值自動選升級、Banish 及安裝還原程式。 |
 | [Unfair Flips](Unfair-Flips/) | 已驗證的 Steam 啟動設定。 |
 
 遊戲原版輸入由各自的安裝取得。第三方工具的版本和取得方式列在各遊戲資料夾。實驗項目的驗證範圍以各自的紀錄為準。
