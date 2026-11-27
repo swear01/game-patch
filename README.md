@@ -13,6 +13,7 @@
 | [Minutescape](Minutescape/) | Challenge Patrol 補丁、封裝工具和版本紀錄。 |
 | [Outhold](Outhold/) | Godot CLI 與來源封裝工具。 |
 | [Particul](Particul/) | Electron 加速和效能修正的腳本與紀錄。 |
+| [Shelldiver](Shelldiver/) | Windows 背景 CLI 潛水、轉金、販售與升級。已驗證 800／800 級及吊床結局。 |
 | [Sixty Four](Sixty-Four/) | Electron 遊戲 API、加速時鐘修正、安裝、移除及測試。 |
 | [Timber Rush](Timber-Rush/) | 依當局數值自動選升級、Banish 及安裝還原程式。 |
 | [Unfair Flips](Unfair-Flips/) | 已驗證的 Steam 啟動設定。 |

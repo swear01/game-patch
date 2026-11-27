@@ -1,0 +1,23 @@
+{
+  "steamAppId": 3862670,
+  "steamBuildId": 23898569,
+  "verifiedUtc": "2026-11-27T20:39:18.110189Z",
+  "nativeSkillLevels": 800,
+  "savedSkillLevels": 800,
+  "nodesAtMaximum": 241,
+  "discrepancies": 0,
+  "hammockRank": 1,
+  "hammockCutsceneSaved": true,
+  "completedBranches": {
+    "scrap": 1,
+    "crystal": 1,
+    "obsidian": 1,
+    "mushroom": 1,
+    "flask": 1
+  },
+  "reentry": {
+    "room": "rm_main_menu",
+    "savedRanks": 800,
+    "endingSaved": true
+  }
+}
