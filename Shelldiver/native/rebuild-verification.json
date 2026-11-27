@@ -1,0 +1,84 @@
+{
+  "schemaVersion": 1,
+  "compilerToolset": "14.44.35207",
+  "platform": "win-x64",
+  "offlineSmokeTest": "passed",
+  "sourceSdkFilesMatchedOfficial": 7,
+  "comparison": {
+    "format": "PE x64",
+    "deployedHash": "ab42cf7662f90db3b78cb412946342d8f81e91b793ba4edb8da83f4ac76976b7",
+    "rebuildHash": "8b52288828e7549609ba576cb337a5a3ddcc4431de463206e3460351c6f00a28",
+    "installedTimestamp": 1795808347,
+    "rebuildTimestamp": 1795814804,
+    "sections": [
+      {
+        "name": ".text",
+        "rva": 4096,
+        "size": 226304,
+        "matching": false,
+        "installedSha256": "ab3c8fa43dec7586e6a60d3789d0dcc722e7d7745a29c115050ab40050a6cafc",
+        "rebuiltSha256": "9aa779113254809b12cc9e1eef90af857c59294ee795c6729b84f4ffcee810db"
+      },
+      {
+        "name": ".rdata",
+        "rva": 233472,
+        "size": 73216,
+        "matching": false,
+        "installedSha256": "1328bd837d5d0341e9111dcd54816a1ff755a18f5c74c5cf0d2b036ce2403a65",
+        "rebuiltSha256": "3508d57732f15cc97b24f7d00f4efd4f568fd97bc9f424b9dfe45ef374eed855"
+      },
+      {
+        "name": ".data",
+        "rva": 307200,
+        "size": 5120,
+        "matching": false,
+        "installedSha256": "5dfa7a3e670551e21edfd8a70403d88de7a27e6e7f3d90d6c33e948b2f851391",
+        "rebuiltSha256": "d7d9d78177631441a2305b490374785964f6a922bc58e5d11c15e299627ec1fa"
+      },
+      {
+        "name": ".pdata",
+        "rva": 315392,
+        "size": 10240,
+        "matching": true,
+        "installedSha256": "fa30e587650c7f5326687271ee8eddb26fb3c655fffe5d202d541eca59770712",
+        "rebuiltSha256": "fa30e587650c7f5326687271ee8eddb26fb3c655fffe5d202d541eca59770712"
+      },
+      {
+        "name": ".reloc",
+        "rva": 327680,
+        "size": 1024,
+        "matching": true,
+        "installedSha256": "a4baa9489ee04dc6ba4fd4df3ff3cad685144de9534925298ee191697c0b72c6",
+        "rebuiltSha256": "a4baa9489ee04dc6ba4fd4df3ff3cad685144de9534925298ee191697c0b72c6"
+      }
+    ],
+    "rawBytesDiffering": 173,
+    "firstDifferingOffsets": [
+      256,
+      257,
+      1065,
+      3184,
+      3191,
+      3228,
+      3262,
+      3263,
+      3295,
+      3311,
+      3318,
+      3401,
+      3673,
+      3753,
+      3754,
+      3817,
+      3849,
+      4009,
+      4073,
+      66216
+    ],
+    "changedTextBytes": 121,
+    "changedTextInstructions": 109,
+    "identicalAfterSymbolMapping": 109,
+    "dataDifferences": "Six eight-byte labels differ only by MSVC anonymous-namespace decoration. The matching source path changed the decoration and corresponding static data addresses.",
+    "headerDifferences": "PE linker timestamps. Whole-file hashes are intentionally distinct."
+  }
+}

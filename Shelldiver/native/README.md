@@ -12,7 +12,7 @@
 pwsh -NoProfile -File .\Build-ShelldiverNative.ps1 -YYToolkitSource "C:\sdk\YYToolkit-d5cc007" -JsonHeader "C:\sdk\json.hpp" -SmokeTest
 ```
 
-產物是 `build/ShelldiverAutoplayNative.dll`。建置也保留原始連結檔名 `ShelldiverAutoplayParticleRenderSuite.dll`。整檔 SHA-256 可能隨 PE 建置時間戳而變動。原本安裝的 DLL 以 `inputs.json` 中的完整雜湊為準。
+產物是 `build/ShelldiverAutoplayNative.dll`。建置也保留原始連結檔名 `ShelldiverAutoplayParticleRenderSuite.dll`。實測重建檔與部署檔共差 173 bytes，來自 PE 時間戳和 MSVC 靜態符號配置。109 條含位址差異的指令均核對到相同符號，離線測試通過。兩個 DLL 的雜湊和各節區比對結果收錄於[重建紀錄](rebuild-verification.json)。
 
 ## 安裝與驗證
 
